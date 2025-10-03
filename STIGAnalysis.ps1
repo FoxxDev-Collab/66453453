@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    STIG Analysis Tool - Single Script with Database Persistence
+    STIG Analysis Desktop Application with MS Access Database
 
 .DESCRIPTION
-    Analyzes STIG CKL/CKLB files, maps to NIST controls, and exports to Excel.
-    Uses MS Access 2016 for persistent storage.
+    Professional desktop application for analyzing STIG files with persistent data storage.
+    View, search, and analyze STIG data directly in a modern GUI interface.
 
 .NOTES
-    Requirements: Windows 10, PowerShell 5.1+, Microsoft Access Database Engine 2016, Microsoft Office 2016+
-    Version: 2.0 - Single Script Edition
+    Requirements: Windows 10, PowerShell 5.1+, Microsoft Access Database Engine 2016
+    Version: 2.0 - Desktop Application Edition
 #>
 
 #Requires -Version 5.1
@@ -23,11 +23,9 @@ Add-Type -AssemblyName System.Data
 
 # Script configuration
 $ErrorActionPreference = 'Stop'
-$script:DatabasePath = "STIGAnalysis.accdb"
+$script:DatabasePath = Join-Path $PSScriptRoot "STIGAnalysis.accdb"
 $script:DatabaseConnection = $null
-$script:CciMappings = @{}
-$script:VulnerabilityData = @()
-$script:LoadedFiles = @()
+$script:MainForm = $null
 
 #region Database Connection Class
 
@@ -98,36 +96,13 @@ class DatabaseConnection {
 
 #endregion
 
-#region Vulnerability Class
-
-class Vulnerability {
-    [string]$GroupId
-    [string]$RuleId
-    [string]$RuleVersion
-    [string]$RuleTitle
-    [string]$Severity
-    [string]$Status
-    [string]$StigName
-    [string[]]$CCIs
-    [string[]]$NistControls
-    [string[]]$Families
-    [string]$Discussion
-    [string]$CheckContent
-    [string]$FixText
-    [string]$FindingDetails
-    [string]$Comments
-    [string]$SourceFile
-}
-
-#endregion
-
 #region Database Initialization
 
 function Initialize-Database {
     param([string]$DbPath)
     
     if (Test-Path $DbPath) {
-        Write-Host "Database exists, connecting..." -ForegroundColor Green
+        Write-Host "Database found: $DbPath" -ForegroundColor Green
         return $true
     }
     
@@ -148,7 +123,8 @@ function Initialize-Database {
 CREATE TABLE CCI_Mappings (
     CCI_ID VARCHAR(20) PRIMARY KEY,
     NIST_Controls TEXT,
-    Control_Families TEXT
+    Control_Families TEXT,
+    Description TEXT
 )
 "@) | Out-Null
         
@@ -181,7 +157,8 @@ CREATE TABLE Vulnerabilities (
     Check_Content TEXT,
     Fix_Text TEXT,
     Finding_Details TEXT,
-    Comments TEXT
+    Comments TEXT,
+    Import_Date DATETIME
 )
 "@) | Out-Null
         
@@ -204,7 +181,6 @@ function Import-CciMappings {
     
     try {
         [xml]$cciXml = Get-Content -Path $XmlPath -Raw
-        $mappings = @{}
         $count = 0
         
         $ns = New-Object System.Xml.XmlNamespaceManager($cciXml.NameTable)
@@ -212,8 +188,12 @@ function Import-CciMappings {
         
         $cciItems = $cciXml.SelectNodes("//cci:cci_item", $ns)
         
+        # Clear existing mappings
+        $script:DatabaseConnection.ExecuteNonQuery("DELETE FROM CCI_Mappings") | Out-Null
+        
         foreach ($cciItem in $cciItems) {
             $cciId = $cciItem.GetAttribute("id")
+            $definition = $cciItem.SelectSingleNode("cci:definition", $ns).'#text'
             $nistControls = @()
             
             $references = $cciItem.SelectNodes("cci:references/cci:reference", $ns)
@@ -227,25 +207,22 @@ function Import-CciMappings {
             }
             
             if ($nistControls.Count -gt 0) {
-                $mappings[$cciId] = $nistControls | Select-Object -Unique
-                $count++
-                
-                # Save to database
-                $nistStr = ($nistControls -join ', ')
+                $nistStr = ($nistControls -join ', ') -replace "'", "''"
                 $families = ($nistControls | ForEach-Object { 
                     if ($_ -match '^([A-Z]{2,3})-') { $matches[1] }
                 } | Select-Object -Unique) -join ', '
+                $desc = $definition -replace "'", "''"
                 
                 $script:DatabaseConnection.ExecuteNonQuery(@"
-INSERT INTO CCI_Mappings (CCI_ID, NIST_Controls, Control_Families)
-VALUES ('$cciId', '$nistStr', '$families')
+INSERT INTO CCI_Mappings (CCI_ID, NIST_Controls, Control_Families, Description)
+VALUES ('$cciId', '$nistStr', '$families', '$desc')
 "@) | Out-Null
+                $count++
             }
         }
         
         return @{
             Success = $true
-            Mappings = $mappings
             Count = $count
         }
     }
@@ -264,65 +241,73 @@ VALUES ('$cciId', '$nistStr', '$families')
 function Import-CklFile {
     param(
         [string]$Path,
-        [hashtable]$CciMappings
+        [int]$FileId
     )
     
     try {
         [xml]$ckl = Get-Content -Path $Path -Raw
-        $vulnerabilities = [System.Collections.ArrayList]::new()
+        $count = 0
         
         $stigName = $ckl.CHECKLIST.STIGS.iSTIG.STIG_INFO.SI_DATA | 
             Where-Object { $_.SID_NAME -eq 'title' } | 
             Select-Object -ExpandProperty SID_DATA
         
         foreach ($vuln in $ckl.CHECKLIST.STIGS.iSTIG.VULN) {
-            $v = [Vulnerability]::new()
-            
-            $v.GroupId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Num' }).ATTRIBUTE_DATA
-            $v.RuleId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_ID' }).ATTRIBUTE_DATA
-            $v.RuleVersion = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_Ver' }).ATTRIBUTE_DATA
-            $v.RuleTitle = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_Title' }).ATTRIBUTE_DATA
-            $v.Severity = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Severity' }).ATTRIBUTE_DATA
-            $v.Discussion = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Discuss' }).ATTRIBUTE_DATA
-            $v.CheckContent = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Check_Content' }).ATTRIBUTE_DATA
-            $v.FixText = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Fix_Text' }).ATTRIBUTE_DATA.'#text'
+            $groupId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Num' }).ATTRIBUTE_DATA
+            $ruleId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_ID' }).ATTRIBUTE_DATA
+            $ruleTitle = (($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_Title' }).ATTRIBUTE_DATA) -replace "'", "''"
+            $severity = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Severity' }).ATTRIBUTE_DATA
+            $discussion = (($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Discuss' }).ATTRIBUTE_DATA) -replace "'", "''"
+            $checkContent = (($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Check_Content' }).ATTRIBUTE_DATA) -replace "'", "''"
+            $fixText = (($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Fix_Text' }).ATTRIBUTE_DATA.'#text') -replace "'", "''"
             
             $cciRefs = $vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'CCI_REF' }
+            $cciStr = ""
+            $nistStr = ""
+            $familiesStr = ""
+            
             if ($cciRefs) {
-                $v.CCIs = @($cciRefs | ForEach-Object { $_.ATTRIBUTE_DATA } | Where-Object { $_ })
-            } else {
-                $v.CCIs = @()
-            }
-            
-            $nistControls = [System.Collections.Generic.HashSet[string]]::new()
-            $families = [System.Collections.Generic.HashSet[string]]::new()
-            
-            foreach ($cci in $v.CCIs) {
-                if ($CciMappings.ContainsKey($cci)) {
-                    foreach ($control in $CciMappings[$cci]) {
-                        [void]$nistControls.Add($control)
-                        if ($control -match '^([A-Z]{2,3})-') {
-                            [void]$families.Add($matches[1])
+                $ccis = @($cciRefs | ForEach-Object { $_.ATTRIBUTE_DATA } | Where-Object { $_ })
+                $cciStr = ($ccis -join ', ') -replace "'", "''"
+                
+                # Get NIST mappings
+                $nistControls = [System.Collections.Generic.HashSet[string]]::new()
+                $families = [System.Collections.Generic.HashSet[string]]::new()
+                
+                foreach ($cci in $ccis) {
+                    $mapping = $script:DatabaseConnection.ExecuteQuery("SELECT NIST_Controls FROM CCI_Mappings WHERE CCI_ID = '$cci'")
+                    if ($mapping.Rows.Count -gt 0) {
+                        $controls = $mapping.Rows[0].NIST_Controls -split ', '
+                        foreach ($ctrl in $controls) {
+                            [void]$nistControls.Add($ctrl)
+                            if ($ctrl -match '^([A-Z]{2,3})-') {
+                                [void]$families.Add($matches[1])
+                            }
                         }
                     }
                 }
+                
+                $nistStr = (($nistControls | Sort-Object) -join ', ') -replace "'", "''"
+                $familiesStr = (($families | Sort-Object) -join ', ') -replace "'", "''"
             }
             
-            $v.NistControls = @($nistControls)
-            $v.Families = @($families)
-            $v.Status = $vuln.STATUS
-            $v.FindingDetails = $vuln.FINDING_DETAILS
-            $v.Comments = $vuln.COMMENTS
-            $v.StigName = $stigName
-            $v.SourceFile = Split-Path -Path $Path -Leaf
+            $status = $vuln.STATUS
+            $findingDetails = ($vuln.FINDING_DETAILS -replace "'", "''")
+            $comments = ($vuln.COMMENTS -replace "'", "''")
+            $stigNameEsc = $stigName -replace "'", "''"
             
-            [void]$vulnerabilities.Add($v)
+            $script:DatabaseConnection.ExecuteNonQuery(@"
+INSERT INTO Vulnerabilities (File_ID, Group_ID, Rule_ID, Rule_Title, Severity, Status, STIG_Name,
+    CCI_References, NIST_Controls, Control_Families, Discussion, Check_Content, Fix_Text, Finding_Details, Comments, Import_Date)
+VALUES ($FileId, '$groupId', '$ruleId', '$ruleTitle', '$severity', '$status', '$stigNameEsc',
+    '$cciStr', '$nistStr', '$familiesStr', '$discussion', '$checkContent', '$fixText', '$findingDetails', '$comments', NOW())
+"@) | Out-Null
+            $count++
         }
         
         return @{
             Success = $true
-            Vulnerabilities = $vulnerabilities
-            Count = $vulnerabilities.Count
+            Count = $count
         }
     }
     catch {
@@ -336,62 +321,71 @@ function Import-CklFile {
 function Import-CklbFile {
     param(
         [string]$Path,
-        [hashtable]$CciMappings
+        [int]$FileId
     )
     
     try {
         $jsonContent = Get-Content -Path $Path -Raw | ConvertFrom-Json
-        $vulnerabilities = [System.Collections.ArrayList]::new()
+        $count = 0
         
         $stigName = $jsonContent.title
         
         foreach ($vuln in $jsonContent.stigs.rules) {
-            $v = [Vulnerability]::new()
-            
-            $v.GroupId = $vuln.group_id
-            $v.RuleId = $vuln.rule_id
-            $v.RuleVersion = $vuln.rule_version
-            $v.RuleTitle = $vuln.rule_title
-            $v.Severity = $vuln.severity
-            $v.Discussion = $vuln.discussion
-            $v.CheckContent = $vuln.check_content
-            $v.FixText = $vuln.fix_text
+            $groupId = $vuln.group_id
+            $ruleId = $vuln.rule_id
+            $ruleTitle = ($vuln.rule_title -replace "'", "''")
+            $severity = $vuln.severity
+            $discussion = ($vuln.discussion -replace "'", "''")
+            $checkContent = ($vuln.check_content -replace "'", "''")
+            $fixText = ($vuln.fix_text -replace "'", "''")
             
             $cciList = @()
             if ($vuln.cci) { $cciList += @($vuln.cci) }
             if ($vuln.ccis) { $cciList += @($vuln.ccis) }
             if ($vuln.cci_refs) { $cciList += @($vuln.cci_refs) }
-            $v.CCIs = $cciList | Select-Object -Unique | Where-Object { $_ }
+            $ccis = $cciList | Select-Object -Unique | Where-Object { $_ }
             
+            $cciStr = ($ccis -join ', ') -replace "'", "''"
+            $nistStr = ""
+            $familiesStr = ""
+            
+            # Get NIST mappings
             $nistControls = [System.Collections.Generic.HashSet[string]]::new()
             $families = [System.Collections.Generic.HashSet[string]]::new()
             
-            foreach ($cci in $v.CCIs) {
-                if ($CciMappings.ContainsKey($cci)) {
-                    foreach ($control in $CciMappings[$cci]) {
-                        [void]$nistControls.Add($control)
-                        if ($control -match '^([A-Z]{2,3})-') {
+            foreach ($cci in $ccis) {
+                $mapping = $script:DatabaseConnection.ExecuteQuery("SELECT NIST_Controls FROM CCI_Mappings WHERE CCI_ID = '$cci'")
+                if ($mapping.Rows.Count -gt 0) {
+                    $controls = $mapping.Rows[0].NIST_Controls -split ', '
+                    foreach ($ctrl in $controls) {
+                        [void]$nistControls.Add($ctrl)
+                        if ($ctrl -match '^([A-Z]{2,3})-') {
                             [void]$families.Add($matches[1])
                         }
                     }
                 }
             }
             
-            $v.NistControls = @($nistControls)
-            $v.Families = @($families)
-            $v.Status = $vuln.status
-            $v.FindingDetails = $vuln.finding_details
-            $v.Comments = $vuln.comments
-            $v.StigName = $stigName
-            $v.SourceFile = Split-Path -Path $Path -Leaf
+            $nistStr = (($nistControls | Sort-Object) -join ', ') -replace "'", "''"
+            $familiesStr = (($families | Sort-Object) -join ', ') -replace "'", "''"
             
-            [void]$vulnerabilities.Add($v)
+            $status = $vuln.status
+            $findingDetails = ($vuln.finding_details -replace "'", "''")
+            $comments = ($vuln.comments -replace "'", "''")
+            $stigNameEsc = $stigName -replace "'", "''"
+            
+            $script:DatabaseConnection.ExecuteNonQuery(@"
+INSERT INTO Vulnerabilities (File_ID, Group_ID, Rule_ID, Rule_Title, Severity, Status, STIG_Name,
+    CCI_References, NIST_Controls, Control_Families, Discussion, Check_Content, Fix_Text, Finding_Details, Comments, Import_Date)
+VALUES ($FileId, '$groupId', '$ruleId', '$ruleTitle', '$severity', '$status', '$stigNameEsc',
+    '$cciStr', '$nistStr', '$familiesStr', '$discussion', '$checkContent', '$fixText', '$findingDetails', '$comments', NOW())
+"@) | Out-Null
+            $count++
         }
         
         return @{
             Success = $true
-            Vulnerabilities = $vulnerabilities
-            Count = $vulnerabilities.Count
+            Count = $count
         }
     }
     catch {
@@ -404,297 +398,404 @@ function Import-CklbFile {
 
 #endregion
 
-#region Database Save
+#region UI Helpers
 
-function Save-ToDatabase {
+function New-StyledButton {
     param(
-        [string]$FileName,
-        [string]$StigTitle,
-        [array]$Vulnerabilities
+        [string]$Text,
+        [System.Drawing.Point]$Location,
+        [System.Drawing.Size]$Size,
+        [System.Drawing.Color]$BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
     )
     
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Location = $Location
+    $button.Size = $Size
+    $button.BackColor = $BackColor
+    $button.ForeColor = [System.Drawing.Color]::White
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $button.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $button
+}
+
+function Refresh-Dashboard {
+    param($DashboardTab)
+    
+    # Clear existing controls
+    $DashboardTab.Controls.Clear()
+    
+    # Get statistics
+    $stats = @{
+        TotalFiles = 0
+        TotalVulns = 0
+        Open = 0
+        NotAFinding = 0
+        NotReviewed = 0
+        High = 0
+        Medium = 0
+        Low = 0
+    }
+    
     try {
-        # Insert STIG file record
-        $script:DatabaseConnection.ExecuteNonQuery(@"
-INSERT INTO STIG_Files (File_Name, STIG_Title, Import_Date, Record_Count)
-VALUES ('$FileName', '$StigTitle', NOW(), $($Vulnerabilities.Count))
-"@) | Out-Null
+        $filesData = $script:DatabaseConnection.ExecuteQuery("SELECT COUNT(*) AS cnt FROM STIG_Files")
+        $stats.TotalFiles = $filesData.Rows[0].cnt
         
-        # Get the File_ID
-        $fileIdResult = $script:DatabaseConnection.ExecuteQuery("SELECT @@IDENTITY AS FileID")
-        $fileId = $fileIdResult.Rows[0].FileID
+        $vulnsData = $script:DatabaseConnection.ExecuteQuery(@"
+SELECT 
+    COUNT(*) AS Total,
+    SUM(IIF(Status='Open', 1, 0)) AS [Open],
+    SUM(IIF(Status='NotAFinding' OR Status='Not_A_Finding', 1, 0)) AS NotAFinding,
+    SUM(IIF(Status='Not_Reviewed', 1, 0)) AS NotReviewed,
+    SUM(IIF(Severity='high' OR Severity='critical', 1, 0)) AS [High],
+    SUM(IIF(Severity='medium', 1, 0)) AS Medium,
+    SUM(IIF(Severity='low', 1, 0)) AS [Low]
+FROM Vulnerabilities
+"@)
         
-        # Insert vulnerabilities
-        foreach ($v in $Vulnerabilities) {
-            $cciStr = ($v.CCIs -join ', ') -replace "'", "''"
-            $nistStr = ($v.NistControls -join ', ') -replace "'", "''"
-            $familiesStr = ($v.Families -join ', ') -replace "'", "''"
-            $discussion = ($v.Discussion -replace "'", "''")
-            $checkContent = ($v.CheckContent -replace "'", "''")
-            $fixText = ($v.FixText -replace "'", "''")
-            $findingDetails = ($v.FindingDetails -replace "'", "''")
-            $comments = ($v.Comments -replace "'", "''")
-            $ruleTitle = ($v.RuleTitle -replace "'", "''")
-            
-            $script:DatabaseConnection.ExecuteNonQuery(@"
-INSERT INTO Vulnerabilities (File_ID, Group_ID, Rule_ID, Rule_Title, Severity, Status, STIG_Name,
-    CCI_References, NIST_Controls, Control_Families, Discussion, Check_Content, Fix_Text, Finding_Details, Comments)
-VALUES ($fileId, '$($v.GroupId)', '$($v.RuleId)', '$ruleTitle', '$($v.Severity)', '$($v.Status)', '$($v.StigName)',
-    '$cciStr', '$nistStr', '$familiesStr', '$discussion', '$checkContent', '$fixText', '$findingDetails', '$comments')
-"@) | Out-Null
+        if ($vulnsData.Rows.Count -gt 0) {
+            $row = $vulnsData.Rows[0]
+            $stats.TotalVulns = if ($row.Total -is [DBNull]) { 0 } else { $row.Total }
+            $stats.Open = if ($row.Open -is [DBNull]) { 0 } else { $row.Open }
+            $stats.NotAFinding = if ($row.NotAFinding -is [DBNull]) { 0 } else { $row.NotAFinding }
+            $stats.NotReviewed = if ($row.NotReviewed -is [DBNull]) { 0 } else { $row.NotReviewed }
+            $stats.High = if ($row.High -is [DBNull]) { 0 } else { $row.High }
+            $stats.Medium = if ($row.Medium -is [DBNull]) { 0 } else { $row.Medium }
+            $stats.Low = if ($row.Low -is [DBNull]) { 0 } else { $row.Low }
         }
-        
-        Write-Host "Saved $($Vulnerabilities.Count) vulnerabilities to database" -ForegroundColor Green
-        return $true
     }
     catch {
-        Write-Warning "Failed to save to database: $($_.Exception.Message)"
-        return $false
+        Write-Warning "Error loading statistics: $_"
+    }
+    
+    $complianceRate = if ($stats.TotalVulns -gt 0) { 
+        [math]::Round(($stats.NotAFinding / $stats.TotalVulns) * 100, 1)
+    } else { 0 }
+    
+    # Create stat cards
+    $cardY = 20
+    $cardX = 20
+    $cardWidth = 180
+    $cardHeight = 100
+    $cardSpacing = 200
+    
+    $cards = @(
+        @{Label="Total STIG Files"; Value=$stats.TotalFiles; Color=[System.Drawing.Color]::FromArgb(0, 120, 215)},
+        @{Label="Total Findings"; Value=$stats.TotalVulns; Color=[System.Drawing.Color]::FromArgb(0, 120, 215)},
+        @{Label="Open Findings"; Value=$stats.Open; Color=[System.Drawing.Color]::FromArgb(220, 53, 69)},
+        @{Label="Compliance Rate"; Value="$complianceRate%"; Color=[System.Drawing.Color]::FromArgb(40, 167, 69)}
+        @{Label="High Severity"; Value=$stats.High; Color=[System.Drawing.Color]::FromArgb(220, 53, 69)},
+        @{Label="Medium Severity"; Value=$stats.Medium; Color=[System.Drawing.Color]::FromArgb(255, 193, 7)},
+        @{Label="Low Severity"; Value=$stats.Low; Color=[System.Drawing.Color]::FromArgb(40, 167, 69)},
+        @{Label="Not Reviewed"; Value=$stats.NotReviewed; Color=[System.Drawing.Color]::FromArgb(108, 117, 125)}
+    )
+    
+    for ($i = 0; $i -lt $cards.Count; $i++) {
+        $col = $i % 4
+        $row = [math]::Floor($i / 4)
+        
+        $card = New-Object System.Windows.Forms.Panel
+        $card.Location = New-Object System.Drawing.Point(($cardX + $col * $cardSpacing), ($cardY + $row * 120))
+        $card.Size = New-Object System.Drawing.Size($cardWidth, $cardHeight)
+        $card.BackColor = $cards[$i].Color
+        
+        $labelTitle = New-Object System.Windows.Forms.Label
+        $labelTitle.Location = New-Object System.Drawing.Point(10, 10)
+        $labelTitle.Size = New-Object System.Drawing.Size(160, 25)
+        $labelTitle.Text = $cards[$i].Label
+        $labelTitle.ForeColor = [System.Drawing.Color]::White
+        $labelTitle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+        $card.Controls.Add($labelTitle)
+        
+        $labelValue = New-Object System.Windows.Forms.Label
+        $labelValue.Location = New-Object System.Drawing.Point(10, 40)
+        $labelValue.Size = New-Object System.Drawing.Size(160, 50)
+        $labelValue.Text = $cards[$i].Value
+        $labelValue.ForeColor = [System.Drawing.Color]::White
+        $labelValue.Font = New-Object System.Drawing.Font("Segoe UI", 24, [System.Drawing.FontStyle]::Bold)
+        $labelValue.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $card.Controls.Add($labelValue)
+        
+        $DashboardTab.Controls.Add($card)
+    }
+    
+    # Recent imports list
+    $recentLabel = New-Object System.Windows.Forms.Label
+    $recentLabel.Location = New-Object System.Drawing.Point(20, 260)
+    $recentLabel.Size = New-Object System.Drawing.Size(800, 25)
+    $recentLabel.Text = "Recent Imports"
+    $recentLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $DashboardTab.Controls.Add($recentLabel)
+    
+    $recentGrid = New-Object System.Windows.Forms.DataGridView
+    $recentGrid.Location = New-Object System.Drawing.Point(20, 290)
+    $recentGrid.Size = New-Object System.Drawing.Size(820, 300)
+    $recentGrid.ReadOnly = $true
+    $recentGrid.AllowUserToAddRows = $false
+    $recentGrid.SelectionMode = 'FullRowSelect'
+    $recentGrid.BackgroundColor = [System.Drawing.Color]::White
+    $recentGrid.AutoSizeColumnsMode = 'Fill'
+    
+    try {
+        $recentData = $script:DatabaseConnection.ExecuteQuery(@"
+SELECT 
+    File_Name AS [File Name],
+    STIG_Title AS [STIG Title],
+    Import_Date AS [Import Date],
+    Record_Count AS [Findings]
+FROM STIG_Files
+ORDER BY Import_Date DESC
+"@)
+        $recentGrid.DataSource = $recentData
+    }
+    catch {
+        Write-Warning "Error loading recent imports: $_"
+    }
+    
+    $DashboardTab.Controls.Add($recentGrid)
+}
+
+function Refresh-BrowseData {
+    param($DataGrid, $StatusLabel)
+    
+    try {
+        $StatusLabel.Text = "Loading data..."
+        $StatusLabel.Refresh()
+        
+        $data = $script:DatabaseConnection.ExecuteQuery(@"
+SELECT 
+    v.Group_ID AS [Vuln ID],
+    v.Rule_ID AS [Rule ID],
+    v.Rule_Title AS [Title],
+    v.Severity,
+    v.Status,
+    v.NIST_Controls AS [NIST Controls],
+    v.Control_Families AS [Families],
+    v.CCI_References AS [CCIs],
+    v.STIG_Name AS [STIG Name],
+    s.File_Name AS [Source File]
+FROM Vulnerabilities v
+LEFT JOIN STIG_Files s ON v.File_ID = s.File_ID
+ORDER BY v.Severity DESC, v.Status
+"@)
+        
+        $DataGrid.DataSource = $data
+        $DataGrid.AutoSizeColumnsMode = 'Fill'
+        
+        # Color code severity column
+        foreach ($row in $DataGrid.Rows) {
+            $severity = $row.Cells["Severity"].Value
+            if ($severity -eq "high" -or $severity -eq "critical") {
+                $row.Cells["Severity"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 200, 200)
+            }
+            elseif ($severity -eq "medium") {
+                $row.Cells["Severity"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 245, 200)
+            }
+            elseif ($severity -eq "low") {
+                $row.Cells["Severity"].Style.BackColor = [System.Drawing.Color]::FromArgb(200, 255, 200)
+            }
+        }
+        
+        $StatusLabel.Text = "Loaded $($data.Rows.Count) vulnerabilities"
+        $StatusLabel.ForeColor = [System.Drawing.Color]::Green
+    }
+    catch {
+        $StatusLabel.Text = "Error loading data: $($_.Exception.Message)"
+        $StatusLabel.ForeColor = [System.Drawing.Color]::Red
     }
 }
 
 #endregion
 
-#region Excel Export (from old script)
+#region Main Form
 
-function Export-ToExcel {
-    param(
-        [array]$Vulnerabilities,
-        [string]$OutputPath
-    )
-    
-    $excel = $null
-    $workbook = $null
-    
-    try {
-        Write-Host "Creating Excel workbook..." -ForegroundColor Cyan
-        
-        $excel = New-Object -ComObject Excel.Application
-        $excel.Visible = $false
-        $excel.DisplayAlerts = $false
-        $workbook = $excel.Workbooks.Add()
-        
-        # Group by STIG file
-        $stigGroups = $Vulnerabilities | Group-Object -Property SourceFile
-        
-        $headers = @(
-            'NIST Controls', 'NIST Family', 'CCIs', 'Vuln-ID', 'Rule-ID',
-            'Title', 'Severity', 'Status', 'STIG Name',
-            'Discussion', 'Check Content', 'Fix Text', 'Finding Details', 'Comments'
-        )
-        
-        # Create sheets for each STIG file
-        foreach ($stigGroup in $stigGroups) {
-            $sheetName = $stigGroup.Name -replace '\.(ckl|cklb)$', '' -replace '[:\\\/\[\]\*\?<\>\|\-]', '_'
-            if ($sheetName.Length -gt 31) { $sheetName = $sheetName.Substring(0, 31) }
-            
-            $worksheet = $workbook.Worksheets.Add()
-            $worksheet.Name = $sheetName
-            
-            # Headers
-            for ($col = 1; $col -le $headers.Count; $col++) {
-                $worksheet.Cells.Item(1, $col) = $headers[$col - 1]
-                $worksheet.Cells.Item(1, $col).Font.Bold = $true
-            }
-            
-            # Data
-            $row = 2
-            foreach ($v in $stigGroup.Group) {
-                $worksheet.Cells.Item($row, 1) = ($v.NistControls -join ', ')
-                $worksheet.Cells.Item($row, 2) = ($v.Families -join ', ')
-                $worksheet.Cells.Item($row, 3) = ($v.CCIs -join ', ')
-                $worksheet.Cells.Item($row, 4) = $v.GroupId
-                $worksheet.Cells.Item($row, 5) = $v.RuleId
-                $worksheet.Cells.Item($row, 6) = $v.RuleTitle
-                $worksheet.Cells.Item($row, 7) = $v.Severity
-                $worksheet.Cells.Item($row, 8) = $v.Status
-                $worksheet.Cells.Item($row, 9) = $v.StigName
-                $worksheet.Cells.Item($row, 10) = $v.Discussion
-                $worksheet.Cells.Item($row, 11) = $v.CheckContent
-                $worksheet.Cells.Item($row, 12) = $v.FixText
-                $worksheet.Cells.Item($row, 13) = $v.FindingDetails
-                $worksheet.Cells.Item($row, 14) = $v.Comments
-                $row++
-            }
-            
-            # Auto-fit columns
-            $worksheet.UsedRange.EntireColumn.AutoFit() | Out-Null
-        }
-        
-        # Remove default sheet
-        try {
-            $workbook.Worksheets.Item("Sheet1").Delete()
-        } catch {}
-        
-        # Save
-        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
-        $workbook.SaveAs($fullPath, 51)
-        $workbook.Close($false)
-        
-        Write-Host "Excel file created: $OutputPath" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Error "Excel export failed: $($_.Exception.Message)"
-        return $false
-    }
-    finally {
-        if ($workbook) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null }
-        if ($excel) {
-            $excel.Quit()
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
-        }
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-    }
-}
-
-#endregion
-
-#region GUI
-
-function Show-MainForm {
+function Show-MainApplication {
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "STIG Analysis Tool v2.0"
-    $form.Size = New-Object System.Drawing.Size(900, 650)
+    $form.Text = "STIG Analysis Desktop Application"
+    $form.Size = New-Object System.Drawing.Size(1200, 800)
     $form.StartPosition = "CenterScreen"
-    $form.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 245)
+    $form.BackColor = [System.Drawing.Color]::White
+    $form.MinimumSize = New-Object System.Drawing.Size(1000, 600)
     
-    # Header
-    $headerPanel = New-Object System.Windows.Forms.Panel
-    $headerPanel.Location = New-Object System.Drawing.Point(0, 0)
-    $headerPanel.Size = New-Object System.Drawing.Size(900, 70)
-    $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
-    $form.Controls.Add($headerPanel)
+    # Menu Bar
+    $menuStrip = New-Object System.Windows.Forms.MenuStrip
     
-    $titleLabel = New-Object System.Windows.Forms.Label
-    $titleLabel.Location = New-Object System.Drawing.Point(20, 20)
-    $titleLabel.Size = New-Object System.Drawing.Size(600, 30)
-    $titleLabel.Text = "STIG to NIST Control Mapper (Database Edition)"
-    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
-    $titleLabel.ForeColor = [System.Drawing.Color]::White
-    $headerPanel.Controls.Add($titleLabel)
+    $fileMenu = New-Object System.Windows.Forms.ToolStripMenuItem("&File")
+    $importCciMenu = New-Object System.Windows.Forms.ToolStripMenuItem("Import CCI Mappings...")
+    $importStigMenu = New-Object System.Windows.Forms.ToolStripMenuItem("Import STIG Files...")
+    $exitMenu = New-Object System.Windows.Forms.ToolStripMenuItem("E&xit")
     
-    # CCI Group
+    [void]$fileMenu.DropDownItems.Add($importCciMenu)
+    [void]$fileMenu.DropDownItems.Add($importStigMenu)
+    [void]$fileMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$fileMenu.DropDownItems.Add($exitMenu)
+    [void]$menuStrip.Items.Add($fileMenu)
+    
+    $viewMenu = New-Object System.Windows.Forms.ToolStripMenuItem("&View")
+    $refreshMenu = New-Object System.Windows.Forms.ToolStripMenuItem("&Refresh")
+    [void]$viewMenu.DropDownItems.Add($refreshMenu)
+    [void]$menuStrip.Items.Add($viewMenu)
+    
+    $form.Controls.Add($menuStrip)
+    
+    # Tab Control
+    $tabControl = New-Object System.Windows.Forms.TabControl
+    $tabControl.Location = New-Object System.Drawing.Point(0, 28)
+    $tabControl.Size = New-Object System.Drawing.Size(1184, 740)
+    $tabControl.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor 
+                         [System.Windows.Forms.AnchorStyles]::Bottom -bor
+                         [System.Windows.Forms.AnchorStyles]::Left -bor
+                         [System.Windows.Forms.AnchorStyles]::Right
+    
+    # Dashboard Tab
+    $dashboardTab = New-Object System.Windows.Forms.TabPage
+    $dashboardTab.Text = "  Dashboard  "
+    $dashboardTab.BackColor = [System.Drawing.Color]::WhiteSmoke
+    $tabControl.Controls.Add($dashboardTab)
+    
+    # Browse Data Tab
+    $browseTab = New-Object System.Windows.Forms.TabPage
+    $browseTab.Text = "  Browse Data  "
+    $browseTab.BackColor = [System.Drawing.Color]::White
+    
+    $browseToolbar = New-Object System.Windows.Forms.Panel
+    $browseToolbar.Dock = [System.Windows.Forms.DockStyle]::Top
+    $browseToolbar.Height = 50
+    $browseToolbar.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    
+    $refreshDataBtn = New-StyledButton -Text "Refresh" -Location (New-Object System.Drawing.Point(10, 10)) -Size (New-Object System.Drawing.Size(100, 30))
+    $browseToolbar.Controls.Add($refreshDataBtn)
+    
+    $searchLabel = New-Object System.Windows.Forms.Label
+    $searchLabel.Text = "Search:"
+    $searchLabel.Location = New-Object System.Drawing.Point(130, 15)
+    $searchLabel.Size = New-Object System.Drawing.Size(60, 20)
+    $browseToolbar.Controls.Add($searchLabel)
+    
+    $searchBox = New-Object System.Windows.Forms.TextBox
+    $searchBox.Location = New-Object System.Drawing.Point(190, 12)
+    $searchBox.Size = New-Object System.Drawing.Size(300, 25)
+    $browseToolbar.Controls.Add($searchBox)
+    
+    $searchBtn = New-StyledButton -Text "Search" -Location (New-Object System.Drawing.Point(500, 10)) -Size (New-Object System.Drawing.Size(80, 30))
+    $browseToolbar.Controls.Add($searchBtn)
+    
+    $browseTab.Controls.Add($browseToolbar)
+    
+    $browseDataGrid = New-Object System.Windows.Forms.DataGridView
+    $browseDataGrid.Location = New-Object System.Drawing.Point(0, 50)
+    $browseDataGrid.Size = New-Object System.Drawing.Size(1175, 610)
+    $browseDataGrid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor 
+                             [System.Windows.Forms.AnchorStyles]::Bottom -bor
+                             [System.Windows.Forms.AnchorStyles]::Left -bor
+                             [System.Windows.Forms.AnchorStyles]::Right
+    $browseDataGrid.ReadOnly = $true
+    $browseDataGrid.AllowUserToAddRows = $false
+    $browseDataGrid.SelectionMode = 'FullRowSelect'
+    $browseDataGrid.BackgroundColor = [System.Drawing.Color]::White
+    $browseTab.Controls.Add($browseDataGrid)
+    
+    $browseStatusLabel = New-Object System.Windows.Forms.Label
+    $browseStatusLabel.Location = New-Object System.Drawing.Point(10, 668)
+    $browseStatusLabel.Size = New-Object System.Drawing.Size(1000, 20)
+    $browseStatusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+    $browseStatusLabel.Text = "Ready"
+    $browseTab.Controls.Add($browseStatusLabel)
+    
+    $tabControl.Controls.Add($browseTab)
+    
+    # Import Tab
+    $importTab = New-Object System.Windows.Forms.TabPage
+    $importTab.Text = "  Import Data  "
+    $importTab.BackColor = [System.Drawing.Color]::White
+    
+    $importPanel = New-Object System.Windows.Forms.Panel
+    $importPanel.Location = New-Object System.Drawing.Point(50, 50)
+    $importPanel.Size = New-Object System.Drawing.Size(700, 400)
+    
     $cciGroupBox = New-Object System.Windows.Forms.GroupBox
-    $cciGroupBox.Location = New-Object System.Drawing.Point(20, 90)
-    $cciGroupBox.Size = New-Object System.Drawing.Size(850, 90)
-    $cciGroupBox.Text = " 1. CCI Mappings (U_CCI_List.xml) "
+    $cciGroupBox.Location = New-Object System.Drawing.Point(0, 0)
+    $cciGroupBox.Size = New-Object System.Drawing.Size(700, 100)
+    $cciGroupBox.Text = " Import CCI Mappings (U_CCI_List.xml) "
     $cciGroupBox.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($cciGroupBox)
     
-    $cciTextBox = New-Object System.Windows.Forms.TextBox
-    $cciTextBox.Location = New-Object System.Drawing.Point(15, 30)
-    $cciTextBox.Size = New-Object System.Drawing.Size(650, 23)
-    $cciTextBox.ReadOnly = $true
-    $cciGroupBox.Controls.Add($cciTextBox)
-    
-    $cciBrowseBtn = New-Object System.Windows.Forms.Button
-    $cciBrowseBtn.Location = New-Object System.Drawing.Point(675, 28)
-    $cciBrowseBtn.Size = New-Object System.Drawing.Size(160, 28)
-    $cciBrowseBtn.Text = "Browse & Import..."
-    $cciBrowseBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
-    $cciBrowseBtn.ForeColor = [System.Drawing.Color]::White
-    $cciBrowseBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $cciGroupBox.Controls.Add($cciBrowseBtn)
+    $importCciBtn = New-StyledButton -Text "Import CCI File..." -Location (New-Object System.Drawing.Point(20, 30)) -Size (New-Object System.Drawing.Size(200, 40))
+    $importCciBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $cciGroupBox.Controls.Add($importCciBtn)
     
     $cciStatusLabel = New-Object System.Windows.Forms.Label
-    $cciStatusLabel.Location = New-Object System.Drawing.Point(15, 60)
-    $cciStatusLabel.Size = New-Object System.Drawing.Size(820, 20)
+    $cciStatusLabel.Location = New-Object System.Drawing.Point(240, 35)
+    $cciStatusLabel.Size = New-Object System.Drawing.Size(440, 30)
     $cciStatusLabel.Text = "No CCI mappings loaded"
     $cciStatusLabel.ForeColor = [System.Drawing.Color]::Gray
     $cciGroupBox.Controls.Add($cciStatusLabel)
     
-    # STIG Files Group
+    $importPanel.Controls.Add($cciGroupBox)
+    
     $stigGroupBox = New-Object System.Windows.Forms.GroupBox
-    $stigGroupBox.Location = New-Object System.Drawing.Point(20, 200)
-    $stigGroupBox.Size = New-Object System.Drawing.Size(850, 300)
-    $stigGroupBox.Text = " 2. STIG Files (CKL/CKLB) "
+    $stigGroupBox.Location = New-Object System.Drawing.Point(0, 120)
+    $stigGroupBox.Size = New-Object System.Drawing.Size(700, 100)
+    $stigGroupBox.Text = " Import STIG Files (CKL/CKLB) "
     $stigGroupBox.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($stigGroupBox)
     
-    $stigListBox = New-Object System.Windows.Forms.ListBox
-    $stigListBox.Location = New-Object System.Drawing.Point(15, 30)
-    $stigListBox.Size = New-Object System.Drawing.Size(650, 220)
-    $stigGroupBox.Controls.Add($stigListBox)
+    $importStigBtn = New-StyledButton -Text "Import STIG Files..." -Location (New-Object System.Drawing.Point(20, 30)) -Size (New-Object System.Drawing.Size(200, 40))
+    $importStigBtn.BackColor = [System.Drawing.Color]::FromArgb(40, 167, 69)
+    $stigGroupBox.Controls.Add($importStigBtn)
     
-    $stigAddBtn = New-Object System.Windows.Forms.Button
-    $stigAddBtn.Location = New-Object System.Drawing.Point(675, 30)
-    $stigAddBtn.Size = New-Object System.Drawing.Size(160, 30)
-    $stigAddBtn.Text = "Add Files..."
-    $stigAddBtn.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
-    $stigAddBtn.ForeColor = [System.Drawing.Color]::White
-    $stigAddBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $stigGroupBox.Controls.Add($stigAddBtn)
+    $stigStatusLabel = New-Object System.Windows.Forms.Label
+    $stigStatusLabel.Location = New-Object System.Drawing.Point(240, 35)
+    $stigStatusLabel.Size = New-Object System.Drawing.Size(440, 30)
+    $stigStatusLabel.Text = "No STIG files loaded"
+    $stigStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+    $stigGroupBox.Controls.Add($stigStatusLabel)
     
-    $stigClearBtn = New-Object System.Windows.Forms.Button
-    $stigClearBtn.Location = New-Object System.Drawing.Point(675, 70)
-    $stigClearBtn.Size = New-Object System.Drawing.Size(160, 30)
-    $stigClearBtn.Text = "Clear All"
-    $stigClearBtn.BackColor = [System.Drawing.Color]::Gray
-    $stigClearBtn.ForeColor = [System.Drawing.Color]::White
-    $stigClearBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $stigGroupBox.Controls.Add($stigClearBtn)
+    $importPanel.Controls.Add($stigGroupBox)
     
-    $stigStatsLabel = New-Object System.Windows.Forms.Label
-    $stigStatsLabel.Location = New-Object System.Drawing.Point(15, 260)
-    $stigStatsLabel.Size = New-Object System.Drawing.Size(820, 30)
-    $stigStatsLabel.Text = "No STIG files loaded"
-    $stigStatsLabel.ForeColor = [System.Drawing.Color]::Gray
-    $stigGroupBox.Controls.Add($stigStatsLabel)
+    $importTab.Controls.Add($importPanel)
+    $tabControl.Controls.Add($importTab)
     
-    # Export Button
-    $exportBtn = New-Object System.Windows.Forms.Button
-    $exportBtn.Location = New-Object System.Drawing.Point(20, 520)
-    $exportBtn.Size = New-Object System.Drawing.Size(200, 40)
-    $exportBtn.Text = "3. Export to Excel..."
-    $exportBtn.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-    $exportBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
-    $exportBtn.ForeColor = [System.Drawing.Color]::White
-    $exportBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $exportBtn.Enabled = $false
-    $form.Controls.Add($exportBtn)
+    $form.Controls.Add($tabControl)
     
-    $exportStatusLabel = New-Object System.Windows.Forms.Label
-    $exportStatusLabel.Location = New-Object System.Drawing.Point(230, 525)
-    $exportStatusLabel.Size = New-Object System.Drawing.Size(640, 30)
-    $exportStatusLabel.Text = "Load CCI mappings and STIG files to enable export"
-    $exportStatusLabel.ForeColor = [System.Drawing.Color]::Gray
-    $form.Controls.Add($exportStatusLabel)
+    # Status Bar
+    $statusBar = New-Object System.Windows.Forms.StatusStrip
+    $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $statusLabel.Text = "Ready | Database: $script:DatabasePath"
+    [void]$statusBar.Items.Add($statusLabel)
+    $form.Controls.Add($statusBar)
     
     # Event Handlers
-    $cciBrowseBtn.Add_Click({
+    $importCciBtn.Add_Click({
         $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
         $openFileDialog.Filter = "CCI List XML (*.xml)|*.xml"
         $openFileDialog.Title = "Select U_CCI_List.xml"
         
         if ($openFileDialog.ShowDialog() -eq "OK") {
-            $cciTextBox.Text = $openFileDialog.FileName
-            $cciStatusLabel.Text = "Importing CCI mappings..."
-            $form.Refresh()
+            $cciStatusLabel.Text = "Importing..."
+            $cciStatusLabel.Refresh()
             
             $result = Import-CciMappings -XmlPath $openFileDialog.FileName
             
             if ($result.Success) {
-                $script:CciMappings = $result.Mappings
-                $cciStatusLabel.Text = "[OK] Loaded $($result.Count) CCI mappings from database"
+                $cciStatusLabel.Text = "✓ Loaded $($result.Count) CCI mappings"
                 $cciStatusLabel.ForeColor = [System.Drawing.Color]::Green
-                
-                if ($script:VulnerabilityData.Count -gt 0) {
-                    $exportBtn.Enabled = $true
-                }
+                [System.Windows.Forms.MessageBox]::Show("Successfully imported $($result.Count) CCI mappings!", "Success", "OK", "Information")
             }
             else {
-                [System.Windows.Forms.MessageBox]::Show("Failed: $($result.Error)", "Error", "OK", "Error")
-                $cciStatusLabel.Text = "[ERROR] Failed to load CCI mappings"
+                $cciStatusLabel.Text = "✗ Import failed"
                 $cciStatusLabel.ForeColor = [System.Drawing.Color]::Red
+                [System.Windows.Forms.MessageBox]::Show("Failed: $($result.Error)", "Error", "OK", "Error")
             }
         }
     })
     
-    $stigAddBtn.Add_Click({
-        if ($script:CciMappings.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("Please load CCI mappings first.", "Information", "OK", "Information")
+    $importCciMenu.Add_Click($importCciBtn.GetInvocationList()[0])
+    
+    $importStigBtn.Add_Click({
+        # Check if CCI mappings exist
+        $cciCount = $script:DatabaseConnection.ExecuteQuery("SELECT COUNT(*) AS cnt FROM CCI_Mappings")
+        if ($cciCount.Rows[0].cnt -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Please import CCI mappings first.", "Information", "OK", "Information")
             return
         }
         
@@ -704,80 +805,138 @@ function Show-MainForm {
         $openFileDialog.Multiselect = $true
         
         if ($openFileDialog.ShowDialog() -eq "OK") {
+            $totalImported = 0
+            $totalVulns = 0
+            
             foreach ($file in $openFileDialog.FileNames) {
                 $fileName = Split-Path -Path $file -Leaf
-                
-                if ($script:LoadedFiles -contains $fileName) {
-                    continue
-                }
-                
                 $extension = [System.IO.Path]::GetExtension($file).ToLower()
-                $result = $null
                 
-                if ($extension -eq '.ckl' -or $extension -eq '.xml') {
-                    $result = Import-CklFile -Path $file -CciMappings $script:CciMappings
+                $stigStatusLabel.Text = "Importing $fileName..."
+                $stigStatusLabel.Refresh()
+                
+                # Check if already imported
+                $existing = $script:DatabaseConnection.ExecuteQuery("SELECT File_ID FROM STIG_Files WHERE File_Name = '$fileName'")
+                $stigTitle = ""
+                
+                if ($extension -eq '.ckl') {
+                    [xml]$ckl = Get-Content -Path $file -Raw
+                    $stigTitle = $ckl.CHECKLIST.STIGS.iSTIG.STIG_INFO.SI_DATA | 
+                        Where-Object { $_.SID_NAME -eq 'title' } | 
+                        Select-Object -ExpandProperty SID_DATA
                 }
-                elseif ($extension -eq '.cklb' -or $extension -eq '.json') {
-                    $result = Import-CklbFile -Path $file -CciMappings $script:CciMappings
+                elseif ($extension -eq '.cklb') {
+                    $json = Get-Content -Path $file -Raw | ConvertFrom-Json
+                    $stigTitle = $json.title
                 }
                 
-                if ($result -and $result.Success) {
-                    $script:VulnerabilityData += $result.Vulnerabilities
-                    $script:LoadedFiles += $fileName
-                    $stigListBox.Items.Add("$fileName ($($result.Count) findings)")
+                $stigTitleEsc = $stigTitle -replace "'", "''"
+                
+                if ($existing.Rows.Count -eq 0) {
+                    # Insert STIG file record
+                    $script:DatabaseConnection.ExecuteNonQuery(@"
+INSERT INTO STIG_Files (File_Name, STIG_Title, Import_Date, Record_Count)
+VALUES ('$fileName', '$stigTitleEsc', NOW(), 0)
+"@) | Out-Null
                     
-                    # Save to database
-                    Save-ToDatabase -FileName $fileName -StigTitle $result.Vulnerabilities[0].StigName -Vulnerabilities $result.Vulnerabilities
+                    $fileIdResult = $script:DatabaseConnection.ExecuteQuery("SELECT @@IDENTITY AS FileID")
+                    $fileId = $fileIdResult.Rows[0].FileID
+                    
+                    # Import vulnerabilities
+                    if ($extension -eq '.ckl') {
+                        $result = Import-CklFile -Path $file -FileId $fileId
+                    }
+                    else {
+                        $result = Import-CklbFile -Path $file -FileId $fileId
+                    }
+                    
+                    if ($result.Success) {
+                        # Update record count
+                        $script:DatabaseConnection.ExecuteNonQuery("UPDATE STIG_Files SET Record_Count = $($result.Count) WHERE File_ID = $fileId") | Out-Null
+                        $totalImported++
+                        $totalVulns += $result.Count
+                    }
                 }
             }
             
-            $stigStatsLabel.Text = "[OK] Loaded $($script:LoadedFiles.Count) files with $($script:VulnerabilityData.Count) total findings"
-            $stigStatsLabel.ForeColor = [System.Drawing.Color]::Green
-            $exportBtn.Enabled = $true
+            if ($totalImported -gt 0) {
+                $stigStatusLabel.Text = "✓ Imported $totalImported files with $totalVulns findings"
+                $stigStatusLabel.ForeColor = [System.Drawing.Color]::Green
+                [System.Windows.Forms.MessageBox]::Show("Successfully imported $totalImported STIG files with $totalVulns total findings!", "Success", "OK", "Information")
+                
+                # Refresh dashboard
+                Refresh-Dashboard -DashboardTab $dashboardTab
+            }
+            else {
+                $stigStatusLabel.Text = "All files already imported"
+                $stigStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+            }
         }
     })
     
-    $stigClearBtn.Add_Click({
-        $script:VulnerabilityData = @()
-        $script:LoadedFiles = @()
-        $stigListBox.Items.Clear()
-        $stigStatsLabel.Text = "No STIG files loaded"
-        $stigStatsLabel.ForeColor = [System.Drawing.Color]::Gray
-        $exportBtn.Enabled = $false
+    $importStigMenu.Add_Click($importStigBtn.GetInvocationList()[0])
+    
+    $refreshDataBtn.Add_Click({
+        Refresh-BrowseData -DataGrid $browseDataGrid -StatusLabel $browseStatusLabel
     })
     
-    $exportBtn.Add_Click({
-        if ($script:VulnerabilityData.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("No data to export.", "Information", "OK", "Information")
+    $searchBtn.Add_Click({
+        $searchTerm = $searchBox.Text
+        if ([string]::IsNullOrWhiteSpace($searchTerm)) {
+            Refresh-BrowseData -DataGrid $browseDataGrid -StatusLabel $browseStatusLabel
             return
         }
         
-        $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog
-        $saveFileDialog.Filter = "Excel Files (*.xlsx)|*.xlsx"
-        $saveFileDialog.Title = "Save Excel Report"
-        $saveFileDialog.FileName = "STIG-Analysis-$(Get-Date -Format 'yyyyMMdd-HHmmss').xlsx"
-        
-        if ($saveFileDialog.ShowDialog() -eq "OK") {
-            $exportStatusLabel.Text = "Exporting to Excel..."
-            $form.Refresh()
+        try {
+            $browseStatusLabel.Text = "Searching..."
+            $browseStatusLabel.Refresh()
             
-            $success = Export-ToExcel -Vulnerabilities $script:VulnerabilityData -OutputPath $saveFileDialog.FileName
+            $searchTermEsc = $searchTerm -replace "'", "''"
+            $data = $script:DatabaseConnection.ExecuteQuery(@"
+SELECT 
+    v.Group_ID AS [Vuln ID],
+    v.Rule_ID AS [Rule ID],
+    v.Rule_Title AS [Title],
+    v.Severity,
+    v.Status,
+    v.NIST_Controls AS [NIST Controls],
+    v.Control_Families AS [Families],
+    v.CCI_References AS [CCIs],
+    v.STIG_Name AS [STIG Name],
+    s.File_Name AS [Source File]
+FROM Vulnerabilities v
+LEFT JOIN STIG_Files s ON v.File_ID = s.File_ID
+WHERE 
+    v.Rule_Title LIKE '%$searchTermEsc%' OR
+    v.NIST_Controls LIKE '%$searchTermEsc%' OR
+    v.Control_Families LIKE '%$searchTermEsc%' OR
+    v.Group_ID LIKE '%$searchTermEsc%' OR
+    v.Rule_ID LIKE '%$searchTermEsc%' OR
+    v.CCI_References LIKE '%$searchTermEsc%'
+ORDER BY v.Severity DESC
+"@)
             
-            if ($success) {
-                $exportStatusLabel.Text = "[OK] Exported $($script:VulnerabilityData.Count) findings"
-                $exportStatusLabel.ForeColor = [System.Drawing.Color]::Green
-                
-                $openResult = [System.Windows.Forms.MessageBox]::Show("Export complete! Open file now?", "Success", "YesNo", "Information")
-                if ($openResult -eq "Yes") {
-                    Start-Process $saveFileDialog.FileName
-                }
-            }
-            else {
-                $exportStatusLabel.Text = "[ERROR] Export failed"
-                $exportStatusLabel.ForeColor = [System.Drawing.Color]::Red
-            }
+            $browseDataGrid.DataSource = $data
+            $browseStatusLabel.Text = "Found $($data.Rows.Count) results"
+            $browseStatusLabel.ForeColor = [System.Drawing.Color]::Green
+        }
+        catch {
+            $browseStatusLabel.Text = "Search error: $($_.Exception.Message)"
+            $browseStatusLabel.ForeColor = [System.Drawing.Color]::Red
         }
     })
+    
+    $refreshMenu.Add_Click({
+        Refresh-Dashboard -DashboardTab $dashboardTab
+        if ($tabControl.SelectedTab -eq $browseTab) {
+            Refresh-BrowseData -DataGrid $browseDataGrid -StatusLabel $browseStatusLabel
+        }
+    })
+    
+    $exitMenu.Add_Click({ $form.Close() })
+    
+    # Initial load
+    Refresh-Dashboard -DashboardTab $dashboardTab
     
     $form.Add_Shown({ $form.Activate() })
     [void]$form.ShowDialog()
@@ -785,19 +944,10 @@ function Show-MainForm {
 
 #endregion
 
-#region Main
-
-# Check for Excel
-try {
-    $null = New-Object -ComObject Excel.Application -ErrorAction Stop
-}
-catch {
-    [System.Windows.Forms.MessageBox]::Show("Microsoft Excel is not installed.", "Error", "OK", "Error")
-    exit 1
-}
+#region Main Entry Point
 
 # Initialize database
-Write-Host "Initializing database..." -ForegroundColor Cyan
+Write-Host "Initializing STIG Analysis Application..." -ForegroundColor Cyan
 $dbInitialized = Initialize-Database -DbPath $script:DatabasePath
 
 if ($dbInitialized) {
@@ -806,38 +956,27 @@ if ($dbInitialized) {
     $connected = $script:DatabaseConnection.Connect()
     
     if ($connected) {
-        Write-Host "Connected to database" -ForegroundColor Green
+        Write-Host "Database connected successfully" -ForegroundColor Green
+        Write-Host "Starting application..." -ForegroundColor Cyan
         
-        # Load existing CCI mappings from database
-        try {
-            $cciData = $script:DatabaseConnection.ExecuteQuery("SELECT CCI_ID, NIST_Controls FROM CCI_Mappings")
-            $script:CciMappings = @{}
-            foreach ($row in $cciData.Rows) {
-                $script:CciMappings[$row.CCI_ID] = $row.NIST_Controls -split ', '
-            }
-            if ($script:CciMappings.Count -gt 0) {
-                Write-Host "Loaded $($script:CciMappings.Count) existing CCI mappings from database" -ForegroundColor Green
-            }
-        }
-        catch {
-            Write-Verbose "No existing CCI mappings in database"
-        }
-        
-        # Show GUI
-        Show-MainForm
+        # Show main application
+        Show-MainApplication
         
         # Cleanup
+        Write-Host "Closing database connection..." -ForegroundColor Cyan
         $script:DatabaseConnection.Disconnect()
+        Write-Host "Application closed" -ForegroundColor Green
     }
     else {
         Write-Error "Failed to connect to database"
+        [System.Windows.Forms.MessageBox]::Show("Failed to connect to database.", "Error", "OK", "Error")
         exit 1
     }
 }
 else {
     Write-Error "Failed to initialize database"
+    [System.Windows.Forms.MessageBox]::Show("Failed to initialize database. Make sure Microsoft Access Database Engine 2016 is installed.", "Error", "OK", "Error")
     exit 1
 }
 
 #endregion
-
