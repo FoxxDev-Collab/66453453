@@ -962,6 +962,157 @@ ORDER BY s.Import_Date DESC
     $DashboardTab.Controls.Add($recentGrid)
 }
 
+function Refresh-NistCompliance {
+    param(
+        $SummaryGrid,
+        $DetailGrid,
+        $SiteCombo
+    )
+
+    try {
+        # Build site filter
+        $siteFilter = ""
+        if ($SiteCombo -and $SiteCombo.SelectedValue -and $SiteCombo.SelectedValue -gt 0) {
+            $siteId = [int]$SiteCombo.SelectedValue
+            $siteFilter = "WHERE st.Site_ID = $siteId"
+        }
+
+        # Control Family Summary - simplified for Access SQL
+        if ($siteFilter) {
+            $summaryQuery = @"
+SELECT
+    v.Control_Families AS [Control Family],
+    COUNT(*) AS [Total],
+    SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) AS [Compliant],
+    SUM(IIF(v.Status='Not_Applicable', 1, 0)) AS [Not Applicable],
+    SUM(IIF(v.Status='Not_Reviewed', 1, 0)) AS [Not Reviewed],
+    SUM(IIF(v.Status='Open', 1, 0)) AS [Open],
+    ROUND((SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) * 100.0) / COUNT(*), 0) AS [Percentage Compliant]
+FROM (Vulnerabilities v
+INNER JOIN STIG_Files s ON v.File_ID = s.File_ID)
+INNER JOIN Systems st ON s.System_ID = st.System_ID
+$siteFilter
+GROUP BY v.Control_Families
+HAVING v.Control_Families IS NOT NULL AND v.Control_Families <> ''
+ORDER BY v.Control_Families
+"@
+        } else {
+            $summaryQuery = @"
+SELECT
+    v.Control_Families AS [Control Family],
+    COUNT(*) AS [Total],
+    SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) AS [Compliant],
+    SUM(IIF(v.Status='Not_Applicable', 1, 0)) AS [Not Applicable],
+    SUM(IIF(v.Status='Not_Reviewed', 1, 0)) AS [Not Reviewed],
+    SUM(IIF(v.Status='Open', 1, 0)) AS [Open],
+    ROUND((SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) * 100.0) / COUNT(*), 0) AS [Percentage Compliant]
+FROM (Vulnerabilities v
+INNER JOIN STIG_Files s ON v.File_ID = s.File_ID)
+INNER JOIN Systems st ON s.System_ID = st.System_ID
+GROUP BY v.Control_Families
+HAVING v.Control_Families IS NOT NULL AND v.Control_Families <> ''
+ORDER BY v.Control_Families
+"@
+        }
+
+        Write-Host "Debug: NIST Summary Query:" -ForegroundColor Cyan
+        Write-Host $summaryQuery -ForegroundColor Gray
+
+        $summaryData = $script:DatabaseConnection.ExecuteQuery($summaryQuery)
+        $SummaryGrid.DataSource = $summaryData
+
+        # Color code percentage column
+        if ($SummaryGrid.Columns.Contains("Percentage Compliant")) {
+            foreach ($row in $SummaryGrid.Rows) {
+                $percent = $row.Cells["Percentage Compliant"].Value
+                if ($percent -ne $null) {
+                    $pctVal = [double]$percent
+                    if ($pctVal -ge 90) {
+                        $row.Cells["Percentage Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(60, 179, 113)
+                        $row.Cells["Percentage Compliant"].Style.ForeColor = [System.Drawing.Color]::White
+                    }
+                    elseif ($pctVal -ge 70) {
+                        $row.Cells["Percentage Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 215, 0)
+                        $row.Cells["Percentage Compliant"].Style.ForeColor = [System.Drawing.Color]::Black
+                    }
+                    else {
+                        $row.Cells["Percentage Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 100, 100)
+                        $row.Cells["Percentage Compliant"].Style.ForeColor = [System.Drawing.Color]::White
+                    }
+                }
+            }
+        }
+
+        # Detailed Control Breakdown - simplified for Access SQL
+        if ($siteFilter) {
+            $detailQuery = @"
+SELECT TOP 500
+    v.NIST_Controls AS [NIST Control],
+    v.Control_Families AS [Control Family],
+    COUNT(*) AS [Total Findings],
+    SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) AS [Compliant],
+    SUM(IIF(v.Status='Open', 1, 0)) AS [Open],
+    SUM(IIF(v.Status='Not_Reviewed', 1, 0)) AS [Not Reviewed],
+    SUM(IIF(v.Status='Not_Applicable', 1, 0)) AS [Not Applicable],
+    ROUND((SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) * 100.0) / COUNT(*), 0) AS [% Compliant]
+FROM (Vulnerabilities v
+INNER JOIN STIG_Files s ON v.File_ID = s.File_ID)
+INNER JOIN Systems st ON s.System_ID = st.System_ID
+$siteFilter
+GROUP BY v.NIST_Controls, v.Control_Families
+HAVING v.NIST_Controls IS NOT NULL AND v.NIST_Controls <> ''
+ORDER BY v.Control_Families, v.NIST_Controls
+"@
+        } else {
+            $detailQuery = @"
+SELECT TOP 500
+    v.NIST_Controls AS [NIST Control],
+    v.Control_Families AS [Control Family],
+    COUNT(*) AS [Total Findings],
+    SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) AS [Compliant],
+    SUM(IIF(v.Status='Open', 1, 0)) AS [Open],
+    SUM(IIF(v.Status='Not_Reviewed', 1, 0)) AS [Not Reviewed],
+    SUM(IIF(v.Status='Not_Applicable', 1, 0)) AS [Not Applicable],
+    ROUND((SUM(IIF(v.Status='NotAFinding' OR v.Status='Not_A_Finding', 1, 0)) * 100.0) / COUNT(*), 0) AS [% Compliant]
+FROM (Vulnerabilities v
+INNER JOIN STIG_FILES s ON v.File_ID = s.File_ID)
+INNER JOIN Systems st ON s.System_ID = st.System_ID
+GROUP BY v.NIST_Controls, v.Control_Families
+HAVING v.NIST_Controls IS NOT NULL AND v.NIST_Controls <> ''
+ORDER BY v.Control_Families, v.NIST_Controls
+"@
+        }
+
+        $detailData = $script:DatabaseConnection.ExecuteQuery($detailQuery)
+        $DetailGrid.DataSource = $detailData
+
+        # Color code detail grid
+        if ($DetailGrid.Columns.Contains("% Compliant")) {
+            foreach ($row in $DetailGrid.Rows) {
+                $percent = $row.Cells["% Compliant"].Value
+                if ($percent -ne $null) {
+                    $pctVal = [double]$percent
+                    if ($pctVal -ge 90) {
+                        $row.Cells["% Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(60, 179, 113)
+                        $row.Cells["% Compliant"].Style.ForeColor = [System.Drawing.Color]::White
+                    }
+                    elseif ($pctVal -ge 70) {
+                        $row.Cells["% Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 215, 0)
+                        $row.Cells["% Compliant"].Style.ForeColor = [System.Drawing.Color]::Black
+                    }
+                    else {
+                        $row.Cells["% Compliant"].Style.BackColor = [System.Drawing.Color]::FromArgb(255, 100, 100)
+                        $row.Cells["% Compliant"].Style.ForeColor = [System.Drawing.Color]::White
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Error loading NIST compliance: $_"
+    }
+}
+
 function Refresh-BrowseData {
     param(
         $DataGrid,
@@ -2149,8 +2300,83 @@ function Show-MainApplication {
     $cciDataGrid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
     $cciDataGrid.BackgroundColor = [System.Drawing.Color]::White
     $cciPreviewGroup.Controls.Add($cciDataGrid)
-    
+
     $tabControl.Controls.Add($cciManagementTab)
+
+    # NIST Compliance Tab
+    $nistComplianceTab = New-Object System.Windows.Forms.TabPage
+    $nistComplianceTab.Text = "  NIST Compliance  "
+    $nistComplianceTab.BackColor = [System.Drawing.Color]::WhiteSmoke
+
+    # Header
+    $nistHeaderLabel = New-Object System.Windows.Forms.Label
+    $nistHeaderLabel.Location = New-Object System.Drawing.Point(20, 10)
+    $nistHeaderLabel.Size = New-Object System.Drawing.Size(600, 30)
+    $nistHeaderLabel.Text = "NIST 800-53 Control Family Compliance Analysis"
+    $nistHeaderLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $nistComplianceTab.Controls.Add($nistHeaderLabel)
+
+    # Filter toolbar
+    $nistToolbar = New-Object System.Windows.Forms.Panel
+    $nistToolbar.Location = New-Object System.Drawing.Point(0, 50)
+    $nistToolbar.Size = New-Object System.Drawing.Size(1180, 50)
+    $nistToolbar.BackColor = [System.Drawing.Color]::White
+    $nistToolbar.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $nistComplianceTab.Controls.Add($nistToolbar)
+
+    $nistSiteLabel = New-Object System.Windows.Forms.Label
+    $nistSiteLabel.Text = "Filter by Site:"
+    $nistSiteLabel.Location = New-Object System.Drawing.Point(10, 15)
+    $nistSiteLabel.Size = New-Object System.Drawing.Size(80, 20)
+    $nistToolbar.Controls.Add($nistSiteLabel)
+
+    $nistSiteComboBox = New-Object System.Windows.Forms.ComboBox
+    $nistSiteComboBox.Location = New-Object System.Drawing.Point(95, 12)
+    $nistSiteComboBox.Size = New-Object System.Drawing.Size(200, 25)
+    $nistSiteComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $nistToolbar.Controls.Add($nistSiteComboBox)
+
+    $nistRefreshBtn = New-StyledButton -Text "⟳ Refresh" -Location (New-Object System.Drawing.Point(310, 10)) -Size (New-Object System.Drawing.Size(100, 28))
+    $nistRefreshBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $nistToolbar.Controls.Add($nistRefreshBtn)
+
+    # Control Family Summary Table
+    $nistSummaryLabel = New-Object System.Windows.Forms.Label
+    $nistSummaryLabel.Location = New-Object System.Drawing.Point(20, 110)
+    $nistSummaryLabel.Size = New-Object System.Drawing.Size(800, 25)
+    $nistSummaryLabel.Text = "Control Family Compliance Summary"
+    $nistSummaryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $nistComplianceTab.Controls.Add($nistSummaryLabel)
+
+    $nistSummaryGrid = New-Object System.Windows.Forms.DataGridView
+    $nistSummaryGrid.Location = New-Object System.Drawing.Point(20, 140)
+    $nistSummaryGrid.Size = New-Object System.Drawing.Size(1130, 220)
+    $nistSummaryGrid.ReadOnly = $true
+    $nistSummaryGrid.AllowUserToAddRows = $false
+    $nistSummaryGrid.SelectionMode = 'FullRowSelect'
+    $nistSummaryGrid.BackgroundColor = [System.Drawing.Color]::White
+    $nistSummaryGrid.AutoSizeColumnsMode = 'Fill'
+    $nistComplianceTab.Controls.Add($nistSummaryGrid)
+
+    # Detailed Control Breakdown
+    $nistDetailLabel = New-Object System.Windows.Forms.Label
+    $nistDetailLabel.Location = New-Object System.Drawing.Point(20, 375)
+    $nistDetailLabel.Size = New-Object System.Drawing.Size(800, 25)
+    $nistDetailLabel.Text = "Detailed Control Breakdown"
+    $nistDetailLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $nistComplianceTab.Controls.Add($nistDetailLabel)
+
+    $nistDetailGrid = New-Object System.Windows.Forms.DataGridView
+    $nistDetailGrid.Location = New-Object System.Drawing.Point(20, 405)
+    $nistDetailGrid.Size = New-Object System.Drawing.Size(1130, 250)
+    $nistDetailGrid.ReadOnly = $true
+    $nistDetailGrid.AllowUserToAddRows = $false
+    $nistDetailGrid.SelectionMode = 'FullRowSelect'
+    $nistDetailGrid.BackgroundColor = [System.Drawing.Color]::White
+    $nistDetailGrid.AutoSizeColumnsMode = 'Fill'
+    $nistComplianceTab.Controls.Add($nistDetailGrid)
+
+    $tabControl.Controls.Add($nistComplianceTab)
     
     $form.Controls.Add($tabControl)
     
@@ -2175,6 +2401,27 @@ function Show-MainApplication {
                 else {
                     Write-Host "Debug: Missing controls for browse data refresh" -ForegroundColor Red
                 }
+            }
+            elseif ($tabControl.SelectedTab -eq $nistComplianceTab) {
+                Write-Host "Debug: NIST Compliance tab selected, loading data..." -ForegroundColor DarkGray
+                # Populate site dropdown
+                $nistSiteComboBox.DataSource = $null
+                $sites = Get-Sites
+                if ($sites -and $sites.Rows.Count -gt 0) {
+                    $siteItems = New-Object System.Collections.ArrayList
+                    [void]$siteItems.Add([pscustomobject]@{ Site_ID = 0; DisplayName = "All Sites" })
+                    foreach ($row in $sites.Rows) {
+                        $siteId = $row["Site_ID"]
+                        $siteName = $row["Site_Name"]
+                        $name = if ($siteName -is [DBNull] -or [string]::IsNullOrEmpty($siteName)) { '' } else { $siteName.ToString() }
+                        [void]$siteItems.Add([pscustomobject]@{ Site_ID = [int]$siteId; DisplayName = $name })
+                    }
+                    $nistSiteComboBox.DisplayMember = 'DisplayName'
+                    $nistSiteComboBox.ValueMember = 'Site_ID'
+                    $nistSiteComboBox.DataSource = $siteItems
+                    $nistSiteComboBox.SelectedIndex = 0
+                }
+                Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
             }
             elseif ($tabControl.SelectedTab -eq $cciManagementTab) {
                 Write-Host "Debug: CCI Management tab selected, refreshing status..." -ForegroundColor DarkGray
@@ -2603,7 +2850,16 @@ ORDER BY v.Severity DESC
         $browseStatusComboBox.SelectedIndex = 0    # Reset to "All"
         Refresh-BrowseData -DataGrid $browseDataGrid -StatusLabel $browseStatusLabel -SiteCombo $browseSiteComboBox -SystemCombo $browseSystemComboBox -SeverityCombo $browseSeverityComboBox -StatusCombo $browseStatusComboBox
     })
-    
+
+    # NIST Compliance Event Handlers
+    $nistSiteComboBox.Add_SelectedIndexChanged({
+        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
+    })
+
+    $nistRefreshBtn.Add_Click({
+        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
+    })
+
     # CCI Management Event Handlers
     $importCciMgmtBtn.Add_Click({
         $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
