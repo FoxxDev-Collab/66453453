@@ -1,0 +1,1384 @@
+<#
+.SYNOPSIS
+    STIG Analysis Tool - Professional Windows GUI
+    
+.DESCRIPTION
+    Professional STIG analysis tool with Windows Forms GUI.
+    - Import CCI mappings from U_CCI_List.xml
+    - Import STIG CKL/CKLB files
+    - Export to Excel 2016 format
+    - 100% air-gapped compatible (no external dependencies)
+    
+.NOTES
+    Requirements: Windows 10, PowerShell 5.1+, Microsoft Office 2016+
+    Air-gapped: Uses only built-in Windows Forms and Excel COM objects
+    Version: 2.0
+    Author: STIG Analysis Tool
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param()
+
+# Add required assemblies
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Script configuration
+$ErrorActionPreference = 'Stop'
+$script:VulnerabilityData = @()
+$script:CciMappings = @{}
+$script:LoadedFiles = @()
+
+#region Classes
+
+class Vulnerability {
+    [string]$GroupId
+    [string]$RuleId
+    [string]$RuleVersion
+    [string]$RuleTitle
+    [string]$Severity
+    [string]$Status
+    [string]$StigName
+    [string[]]$CCIs
+    [string[]]$NistControls
+    [string[]]$Families
+    [string]$Discussion
+    [string]$CheckContent
+    [string]$FixText
+    [string]$FindingDetails
+    [string]$Comments
+    [string]$SourceFile
+}
+
+#endregion
+
+#region CCI XML Parser
+
+function Import-CciMappings {
+    param([string]$XmlPath)
+    
+    try {
+        [xml]$cciXml = Get-Content -Path $XmlPath -Raw
+        $mappings = @{}
+        $count = 0
+        
+        # Handle XML namespace
+        $ns = New-Object System.Xml.XmlNamespaceManager($cciXml.NameTable)
+        $ns.AddNamespace("cci", "http://iase.disa.mil/cci")
+        
+        $cciItems = $cciXml.SelectNodes("//cci:cci_item", $ns)
+        
+        foreach ($cciItem in $cciItems) {
+            $cciId = $cciItem.GetAttribute("id")
+            $nistControls = @()
+            
+            $references = $cciItem.SelectNodes("cci:references/cci:reference", $ns)
+            foreach ($reference in $references) {
+                $title = $reference.GetAttribute("title")
+                $index = $reference.GetAttribute("index")
+                
+                # Look for NIST 800-53 references
+                if ($title -like '*800-53*' -and $index) {
+                    $nistControls += $index
+                }
+            }
+            
+            if ($nistControls.Count -gt 0) {
+                $mappings[$cciId] = $nistControls | Select-Object -Unique
+                $count++
+            }
+        }
+        
+        return @{
+            Success = $true
+            Mappings = $mappings
+            Count = $count
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+#endregion
+
+#region STIG File Parsers
+
+function Import-CklFile {
+    param(
+        [string]$Path,
+        [hashtable]$CciMappings
+    )
+    
+    try {
+        [xml]$ckl = Get-Content -Path $Path -Raw
+        $vulnerabilities = [System.Collections.ArrayList]::new()
+        
+        $stigName = $ckl.CHECKLIST.STIGS.iSTIG.STIG_INFO.SI_DATA | 
+            Where-Object { $_.SID_NAME -eq 'title' } | 
+            Select-Object -ExpandProperty SID_DATA
+        
+        foreach ($vuln in $ckl.CHECKLIST.STIGS.iSTIG.VULN) {
+            $v = [Vulnerability]::new()
+            
+            $v.GroupId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Num' }).ATTRIBUTE_DATA
+            $v.RuleId = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_ID' }).ATTRIBUTE_DATA
+            $v.RuleVersion = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_Ver' }).ATTRIBUTE_DATA
+            $v.RuleTitle = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Rule_Title' }).ATTRIBUTE_DATA
+            $v.Severity = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Severity' }).ATTRIBUTE_DATA
+            $v.Discussion = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Vuln_Discuss' }).ATTRIBUTE_DATA
+            $v.CheckContent = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Check_Content' }).ATTRIBUTE_DATA
+            $v.FixText = ($vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'Fix_Text' }).ATTRIBUTE_DATA.'#text'
+            
+            # Extract all CCI_REF values (there can be multiple STIG_DATA entries)
+            $cciRefs = $vuln.STIG_DATA | Where-Object { $_.VULN_ATTRIBUTE -eq 'CCI_REF' }
+            if ($cciRefs) {
+                $v.CCIs = @($cciRefs | ForEach-Object { $_.ATTRIBUTE_DATA } | Where-Object { $_ })
+            } else {
+                $v.CCIs = @()
+            }
+            
+            $nistControls = [System.Collections.Generic.HashSet[string]]::new()
+            $families = [System.Collections.Generic.HashSet[string]]::new()
+            
+            foreach ($cci in $v.CCIs) {
+                if ($CciMappings.ContainsKey($cci)) {
+                    foreach ($control in $CciMappings[$cci]) {
+                        [void]$nistControls.Add($control)
+                        if ($control -match '^([A-Z]{2,3})-') {
+                            [void]$families.Add($matches[1])
+                        }
+                    }
+                }
+            }
+            
+            $v.NistControls = @($nistControls)
+            $v.Families = @($families)
+            $v.Status = $vuln.STATUS
+            $v.FindingDetails = $vuln.FINDING_DETAILS
+            $v.Comments = $vuln.COMMENTS
+            $v.StigName = $stigName
+            $v.SourceFile = Split-Path -Path $Path -Leaf
+            
+            [void]$vulnerabilities.Add($v)
+        }
+        
+        return @{
+            Success = $true
+            Vulnerabilities = $vulnerabilities
+            Count = $vulnerabilities.Count
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Import-CklbFile {
+    param(
+        [string]$Path,
+        [hashtable]$CciMappings
+    )
+    
+    try {
+        $jsonContent = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $vulnerabilities = [System.Collections.ArrayList]::new()
+        
+        $stigName = $jsonContent.title
+        
+        foreach ($vuln in $jsonContent.stigs.rules) {
+            $v = [Vulnerability]::new()
+            
+            $v.GroupId = $vuln.group_id
+            $v.RuleId = $vuln.rule_id
+            $v.RuleVersion = $vuln.rule_version
+            $v.RuleTitle = $vuln.rule_title
+            $v.Severity = $vuln.severity
+            $v.Discussion = $vuln.discussion
+            $v.CheckContent = $vuln.check_content
+            $v.FixText = $vuln.fix_text
+            
+            # Extract CCIs - can be in multiple fields (cci, ccis, cci_refs)
+            $cciList = @()
+            if ($vuln.cci) {
+                $cciList += @($vuln.cci)
+            }
+            if ($vuln.ccis) {
+                $cciList += @($vuln.ccis)
+            }
+            if ($vuln.cci_refs) {
+                $cciList += @($vuln.cci_refs)
+            }
+            $v.CCIs = $cciList | Select-Object -Unique | Where-Object { $_ }
+            
+            $nistControls = [System.Collections.Generic.HashSet[string]]::new()
+            $families = [System.Collections.Generic.HashSet[string]]::new()
+            
+            foreach ($cci in $v.CCIs) {
+                if ($CciMappings.ContainsKey($cci)) {
+                    foreach ($control in $CciMappings[$cci]) {
+                        [void]$nistControls.Add($control)
+                        if ($control -match '^([A-Z]{2,3})-') {
+                            [void]$families.Add($matches[1])
+                        }
+                    }
+                }
+            }
+            
+            $v.NistControls = @($nistControls)
+            $v.Families = @($families)
+            $v.Status = $vuln.status
+            $v.FindingDetails = $vuln.finding_details
+            $v.Comments = $vuln.comments
+            $v.StigName = $stigName
+            $v.SourceFile = Split-Path -Path $Path -Leaf
+            
+            [void]$vulnerabilities.Add($v)
+        }
+        
+        return @{
+            Success = $true
+            Vulnerabilities = $vulnerabilities
+            Count = $vulnerabilities.Count
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+#endregion
+
+#region Excel Export
+
+function New-StigSheet {
+    param(
+        [Parameter(Mandatory)]$Workbook,
+        [Parameter(Mandatory)][string]$SheetName,
+        [Parameter(Mandatory)][array]$Vulnerabilities,
+        [Parameter(Mandatory)][array]$Headers
+    )
+    
+    $worksheet = $Workbook.Worksheets.Add()
+    $worksheet.Name = $SheetName
+    
+    # Write headers
+    for ($col = 1; $col -le $Headers.Count; $col++) {
+        $worksheet.Cells.Item(1, $col) = $Headers[$col - 1]
+    }
+    
+    # Write data
+    $row = 2
+    foreach ($v in $Vulnerabilities) {
+        $worksheet.Cells.Item($row, 1) = ($v.NistControls -join ', ')
+        $worksheet.Cells.Item($row, 2) = ($v.Families -join ', ')
+        $worksheet.Cells.Item($row, 3) = ($v.CCIs -join ', ')
+        $worksheet.Cells.Item($row, 4) = $v.GroupId
+        $worksheet.Cells.Item($row, 5) = $v.RuleId
+        $worksheet.Cells.Item($row, 6) = $v.RuleVersion
+        $worksheet.Cells.Item($row, 7) = $v.RuleTitle
+        $worksheet.Cells.Item($row, 8) = $v.Severity
+        $worksheet.Cells.Item($row, 9) = $v.Status
+        $worksheet.Cells.Item($row, 10) = $v.StigName
+        $worksheet.Cells.Item($row, 11) = $v.Discussion
+        $worksheet.Cells.Item($row, 12) = $v.CheckContent
+        $worksheet.Cells.Item($row, 13) = $v.FixText
+        $worksheet.Cells.Item($row, 14) = $v.FindingDetails
+        $worksheet.Cells.Item($row, 15) = $v.Comments
+        $worksheet.Cells.Item($row, 16) = $v.SourceFile
+        $row++
+    }
+    
+    # Convert to Excel Table and apply formatting
+    if ($row -gt 2) {
+        try {
+            # Create table range
+            $tableRange = $worksheet.Range($worksheet.Cells.Item(1, 1), $worksheet.Cells.Item($row - 1, $Headers.Count))
+            
+            # Create ListObject (Excel Table)
+            $tableName = "STIG_$($SheetName -replace '[^a-zA-Z0-9]', '_')"
+            $listObject = $worksheet.ListObjects.Add(1, $tableRange, $null, 1)
+            $listObject.Name = $tableName
+            $listObject.TableStyle = "TableStyleMedium2"
+            
+            # Optimize column widths and row heights
+            $tableRange.EntireColumn.AutoFit() | Out-Null
+            
+            for ($col = 1; $col -le $Headers.Count; $col++) {
+                $colWidth = $worksheet.Columns.Item($col).ColumnWidth
+                if ($col -ge 11) {
+                    if ($colWidth -gt 80) { $worksheet.Columns.Item($col).ColumnWidth = 80 }
+                } elseif ($colWidth -gt 50) {
+                    $worksheet.Columns.Item($col).ColumnWidth = 50
+                }
+            }
+            
+            # Apply text formatting - wrap text and top align
+            $tableRange.WrapText = $true
+            $tableRange.VerticalAlignment = -4160  # xlTop
+            
+            # Auto-fit row heights after wrapping
+            $dataRange = $worksheet.Range($worksheet.Cells.Item(2, 1), $worksheet.Cells.Item($row - 1, $Headers.Count))
+            $dataRange.EntireRow.AutoFit() | Out-Null
+            
+            # Apply conditional formatting
+            $severityCol = 8
+            $severityRange = $worksheet.Range($worksheet.Cells.Item(2, $severityCol), $worksheet.Cells.Item($row - 1, $severityCol))
+            
+            $highCond = $severityRange.FormatConditions.Add(1, 3, "=LOWER(H2)=`"high`"")
+            $highCond.Interior.Color = 0x6060FF
+            $highCond.Font.Color = 0x000080
+            $highCond.Font.Bold = $true
+            
+            $critCond = $severityRange.FormatConditions.Add(1, 3, "=LOWER(H2)=`"critical`"")
+            $critCond.Interior.Color = 0x4040FF
+            $critCond.Font.Color = 0xFFFFFF
+            $critCond.Font.Bold = $true
+            
+            $medCond = $severityRange.FormatConditions.Add(1, 3, "=LOWER(H2)=`"medium`"")
+            $medCond.Interior.Color = 0x99FFFF
+            $medCond.Font.Color = 0x006600
+            
+            $lowCond = $severityRange.FormatConditions.Add(1, 3, "=LOWER(H2)=`"low`"")
+            $lowCond.Interior.Color = 0x90EE90
+            $lowCond.Font.Color = 0x006400
+            
+            $statusCol = 9
+            $statusRange = $worksheet.Range($worksheet.Cells.Item(2, $statusCol), $worksheet.Cells.Item($row - 1, $statusCol))
+            
+            $openCond = $statusRange.FormatConditions.Add(1, 3, "=I2=`"Open`"")
+            $openCond.Interior.Color = 0x6060FF
+            $openCond.Font.Color = 0x000080
+            $openCond.Font.Bold = $true
+            
+            $nafCond = $statusRange.FormatConditions.Add(1, 3, "=I2=`"NotAFinding`"")
+            $nafCond.Interior.Color = 0x90EE90
+            $nafCond.Font.Color = 0x006400
+            
+            $nrCond = $statusRange.FormatConditions.Add(1, 3, "=I2=`"Not_Reviewed`"")
+            $nrCond.Interior.Color = 0xCCFFFF
+            $nrCond.Font.Color = 0x996600
+            
+            $naCond = $statusRange.FormatConditions.Add(1, 3, "=I2=`"NotApplicable`"")
+            $naCond.Interior.Color = 0xD3D3D3
+            $naCond.Font.Color = 0x505050
+            
+        } catch {
+            Write-Verbose "Warning: Could not create table or apply formatting: $_"
+        }
+        
+        # Freeze top row
+        try {
+            $worksheet.Application.ActiveWindow.SplitRow = 1
+            $worksheet.Application.ActiveWindow.FreezePanes = $true
+        } catch {
+            Write-Verbose "Warning: Could not freeze panes: $_"
+        }
+    }
+    
+    return $worksheet
+}
+
+function New-NistControlSheets {
+    param(
+        [System.__ComObject]$Workbook,
+        [System.__ComObject]$InsertAfterSheet
+    )
+    
+    # NIST Control Families
+    $nistFamilies = @(
+        @{Family='AC'; Controls='23'; Subcontrols='89'; Total='112'; NA='50'; Applicable='62'},
+        @{Family='AT'; Controls='4'; Subcontrols='6'; Total='10'; NA='3'; Applicable='7'},
+        @{Family='AU'; Controls='16'; Subcontrols='41'; Total='57'; NA='17'; Applicable='40'},
+        @{Family='CA'; Controls='8'; Subcontrols='14'; Total='22'; NA='10'; Applicable='12'},
+        @{Family='CM'; Controls='11'; Subcontrols='39'; Total='50'; NA='25'; Applicable='25'},
+        @{Family='CP'; Controls='12'; Subcontrols='36'; Total='48'; NA='41'; Applicable='7'},
+        @{Family='IA'; Controls='11'; Subcontrols='45'; Total='56'; NA='25'; Applicable='31'},
+        @{Family='IR'; Controls='10'; Subcontrols='24'; Total='34'; NA='8'; Applicable='26'},
+        @{Family='MA'; Controls='6'; Subcontrols='20'; Total='26'; NA='7'; Applicable='19'},
+        @{Family='MP'; Controls='8'; Subcontrols='14'; Total='22'; NA='4'; Applicable='18'},
+        @{Family='PE'; Controls='19'; Subcontrols='31'; Total='50'; NA='25'; Applicable='25'},
+        @{Family='PL'; Controls='6'; Subcontrols='4'; Total='10'; NA='2'; Applicable='8'},
+        @{Family='PS'; Controls='8'; Subcontrols='7'; Total='15'; NA='2'; Applicable='13'},
+        @{Family='RA'; Controls='5'; Subcontrols='8'; Total='13'; NA='3'; Applicable='10'},
+        @{Family='SA'; Controls='19'; Subcontrols='66'; Total='85'; NA='61'; Applicable='24'},
+        @{Family='SC'; Controls='40'; Subcontrols='75'; Total='115'; NA='62'; Applicable='53'},
+        @{Family='SI'; Controls='16'; Subcontrols='66'; Total='82'; NA='44'; Applicable='38'},
+        @{Family='PM'; Controls='16'; Subcontrols='0'; Total='16'; NA='0'; Applicable='16'}
+    )
+    
+    $headers = @('Control Family', 'Controls', 'Subcontrols', 'Total', 'Not Applicable / Tailored Out', 
+                 'Total Applicable', 'Compliant', 'Partially Compliant', 'Planned / Not Compliant', 'Percentage Compliant')
+    
+    # Helper function to create and format a NIST Control sheet with Excel Table
+    $createNistSheet = {
+        param($SheetName, $Title, $DataRows, $LastRow)
+        
+        $sheet = $Workbook.Worksheets.Add()
+        $sheet.Name = $SheetName
+        
+        # Title row
+        $sheet.Cells.Item(1, 1) = $Title
+        $sheet.Cells.Item(1, 1).Font.Size = 14
+        $sheet.Cells.Item(1, 1).Font.Bold = $true
+        $sheet.Rows.Item(1).RowHeight = 25
+        
+        # Headers row
+        for ($col = 1; $col -le $headers.Count; $col++) {
+            $sheet.Cells.Item(2, $col) = $headers[$col - 1]
+        }
+        
+        # Data rows
+        & $DataRows
+        
+        # Create Excel Table
+        try {
+            $tableRange = $sheet.Range($sheet.Cells.Item(2, 1), $sheet.Cells.Item($LastRow, $headers.Count))
+            $tableName = "Table_$($SheetName -replace '[^a-zA-Z0-9]', '_')"
+            $listObject = $sheet.ListObjects.Add(1, $tableRange, $null, 1)
+            $listObject.Name = $tableName
+            $listObject.TableStyle = "TableStyleMedium2"
+        } catch {
+            Write-Verbose "Warning: Could not create table for $SheetName : $_"
+        }
+        
+        # Column widths
+        $sheet.Columns.Item(1).ColumnWidth = 12
+        $sheet.Columns.Item(2).ColumnWidth = 10
+        $sheet.Columns.Item(3).ColumnWidth = 12
+        $sheet.Columns.Item(4).ColumnWidth = 10
+        $sheet.Columns.Item(5).ColumnWidth = 18
+        $sheet.Columns.Item(6).ColumnWidth = 14
+        $sheet.Columns.Item(7).ColumnWidth = 12
+        $sheet.Columns.Item(8).ColumnWidth = 14
+        $sheet.Columns.Item(9).ColumnWidth = 16
+        $sheet.Columns.Item(10).ColumnWidth = 15
+        
+        return $sheet
+    }
+    
+    $lastRow = 3 + $nistFamilies.Count - 1
+    
+    # Create Compliance sheet FIRST (right after Dashboard)
+    $complianceSheet = & $createNistSheet "Compliance" "ALL CONTROL FAMILIES - COMPLIANCE SUMMARY" {
+        $row = 3
+        foreach ($family in $nistFamilies) {
+            $complianceSheet.Cells.Item($row, 1) = $family.Family
+            $complianceSheet.Cells.Item($row, 2) = $family.Controls
+            $complianceSheet.Cells.Item($row, 3) = $family.Subcontrols
+            $complianceSheet.Cells.Item($row, 4) = $family.Total
+            $complianceSheet.Cells.Item($row, 5) = $family.NA
+            $complianceSheet.Cells.Item($row, 6) = $family.Applicable
+            $complianceSheet.Cells.Item($row, 7).Formula = "=SUM('CAT I Controls'!G$row,'CAT II Controls'!G$row,'CAT III Controls'!G$row)"
+            $complianceSheet.Cells.Item($row, 8).Formula = "=SUM('CAT I Controls'!H$row,'CAT II Controls'!H$row,'CAT III Controls'!H$row)"
+            $complianceSheet.Cells.Item($row, 9).Formula = "=SUM('CAT I Controls'!I$row,'CAT II Controls'!I$row,'CAT III Controls'!I$row)"
+            $complianceSheet.Cells.Item($row, 10).Formula = "=IF(F$row>0,G$row/F$row,0)"
+            $complianceSheet.Cells.Item($row, 10).NumberFormat = "0%"
+            $row++
+        }
+    } $lastRow
+    
+    # Create CAT I Controls sheet
+    $catISheet = & $createNistSheet "CAT I Controls" "CAT I (HIGH CRITICALITY) CONTROLS" {
+        $row = 3
+        foreach ($family in $nistFamilies) {
+            $catISheet.Cells.Item($row, 1) = $family.Family
+            $catISheet.Cells.Item($row, 2) = 0
+            $catISheet.Cells.Item($row, 3) = 0
+            $catISheet.Cells.Item($row, 4) = 0
+            $catISheet.Cells.Item($row, 5) = 0
+            $catISheet.Cells.Item($row, 6) = 0
+            $catISheet.Cells.Item($row, 7) = 0
+            $catISheet.Cells.Item($row, 8) = 0
+            $catISheet.Cells.Item($row, 9) = 0
+            $catISheet.Cells.Item($row, 10).Formula = "=IF(F$row>0,G$row/F$row,0)"
+            $catISheet.Cells.Item($row, 10).NumberFormat = "0%"
+            $row++
+        }
+    } $lastRow
+    
+    # Create CAT II Controls sheet
+    $catIISheet = & $createNistSheet "CAT II Controls" "CAT II (MEDIUM CRITICALITY) CONTROLS" {
+        $row = 3
+        foreach ($family in $nistFamilies) {
+            $catIISheet.Cells.Item($row, 1) = $family.Family
+            $catIISheet.Cells.Item($row, 2) = 0
+            $catIISheet.Cells.Item($row, 3) = 0
+            $catIISheet.Cells.Item($row, 4) = 0
+            $catIISheet.Cells.Item($row, 5) = 0
+            $catIISheet.Cells.Item($row, 6) = 0
+            $catIISheet.Cells.Item($row, 7) = 0
+            $catIISheet.Cells.Item($row, 8) = 0
+            $catIISheet.Cells.Item($row, 9) = 0
+            $catIISheet.Cells.Item($row, 10).Formula = "=IF(F$row>0,G$row/F$row,0)"
+            $catIISheet.Cells.Item($row, 10).NumberFormat = "0%"
+            $row++
+        }
+    } $lastRow
+    
+    # Create CAT III Controls sheet
+    $catIIISheet = & $createNistSheet "CAT III Controls" "CAT III (LOW CRITICALITY) CONTROLS" {
+        $row = 3
+        foreach ($family in $nistFamilies) {
+            $catIIISheet.Cells.Item($row, 1) = $family.Family
+            $catIIISheet.Cells.Item($row, 2) = 0
+            $catIIISheet.Cells.Item($row, 3) = 0
+            $catIIISheet.Cells.Item($row, 4) = 0
+            $catIIISheet.Cells.Item($row, 5) = 0
+            $catIIISheet.Cells.Item($row, 6) = 0
+            $catIIISheet.Cells.Item($row, 7) = 0
+            $catIIISheet.Cells.Item($row, 8) = 0
+            $catIIISheet.Cells.Item($row, 9) = 0
+            $catIIISheet.Cells.Item($row, 10).Formula = "=IF(F$row>0,G$row/F$row,0)"
+            $catIIISheet.Cells.Item($row, 10).NumberFormat = "0%"
+            $row++
+        }
+    } $lastRow
+    
+    # Now reorder sheets to: Dashboard, Compliance, CAT I, CAT II, CAT III
+    # Move sheets to correct position relative to Dashboard
+    try {
+        $dashboardIndex = $InsertAfterSheet.Index
+        $catIIISheet.Move($null, $InsertAfterSheet)
+        $catIISheet.Move($null, $InsertAfterSheet)
+        $catISheet.Move($null, $InsertAfterSheet)
+        $complianceSheet.Move($null, $InsertAfterSheet)
+    } catch {
+        Write-Verbose "Warning: Could not reorder sheets: $_"
+    }
+    
+    Write-Verbose "Created NIST Control sheets in order: Compliance, CAT I, CAT II, CAT III"
+}
+
+function Export-ToExcel {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'dashboardSheet',
+        Justification = 'Variable is used extensively in lines 475-636 for Dashboard creation and cleaned up in finally block')]
+    param(
+        [array]$Vulnerabilities,
+        [string]$OutputPath,
+        [System.Windows.Forms.Label]$StatusLabel = $null,
+        [System.Windows.Forms.ProgressBar]$ProgressBar = $null
+    )
+    
+    $excel = $null
+    $workbook = $null
+    $dashboardSheet = $null  # Dashboard worksheet - created after STIG sheets
+    $sheets = @()
+    
+    try {
+        # Progress tracking setup
+        $totalSteps = 5  # Initialize, Group Data, Create Excel, Create Sheets, Create Dashboard, Save
+        $currentStep = 0
+        
+        # Step 1: Initialize
+        $currentStep++
+        if ($StatusLabel) {
+            $StatusLabel.Text = "Step 1/$totalSteps" + ": Initializing Excel (0%)..."
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        if ($ProgressBar) {
+            $ProgressBar.Style = 'Continuous'
+            $ProgressBar.Minimum = 0
+            $ProgressBar.Maximum = 100
+            $ProgressBar.Value = 0
+        }
+        
+        # Create Excel COM object
+        $excel = New-Object -ComObject Excel.Application
+        $excel.Visible = $false
+        $excel.DisplayAlerts = $false
+        
+        # Create workbook first
+        $workbook = $excel.Workbooks.Add()
+        
+        # Set performance optimizations after workbook is created
+        $excel.ScreenUpdating = $false  # Improve performance
+        try {
+            $excel.Calculation = -4135  # xlCalculationManual
+        } catch {
+            Write-Verbose "Could not set manual calculation: $_"
+        }
+        
+        if ($ProgressBar) {
+            $ProgressBar.Value = 10
+        }
+        
+        # Step 2: Group and prepare data
+        $currentStep++
+        if ($StatusLabel) {
+            $StatusLabel.Text = "Step 2/$totalSteps" + ": Grouping $($Vulnerabilities.Count) vulnerabilities (10%)..."
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        
+        # Group vulnerabilities by STIG file (using parallel processing)
+        $stigGroups = $Vulnerabilities | Group-Object -Property SourceFile
+        
+        if ($ProgressBar) {
+            $ProgressBar.Value = 20
+        }
+        
+        Write-Verbose "Creating $($stigGroups.Count) STIG sheets..."
+        
+        # Define headers for STIG sheets
+        $headers = @(
+            'NIST Controls', 'NIST Family', 'CCIs', 'Vuln-ID', 'Rule-ID',
+            'Rule Version', 'Title', 'Severity', 'Status', 'STIG Name',
+            'Discussion', 'Check Content', 'Fix Text', 'Finding Details',
+            'Comments', 'Source File'
+        )
+        
+        # Calculate progress increments for sheet creation
+        $sheetProgressStart = 20
+        $sheetProgressEnd = 80
+        $sheetProgressRange = $sheetProgressEnd - $sheetProgressStart
+        $sheetIndex = 0
+        
+        foreach ($stigGroup in $stigGroups) {
+            $sheetIndex++
+            $stigFileName = $stigGroup.Name -replace '\.(ckl|cklb)$', ''
+            $stigFileName = $stigFileName -replace '[:\\\/\[\]\*\?\<\>\-]', '_'
+            if ($stigFileName.Length -gt 31) { $stigFileName = $stigFileName.Substring(0, 31) }
+            
+            # Calculate progress percentage for this sheet
+            $sheetProgress = [int]($sheetProgressStart + (($sheetIndex / $stigGroups.Count) * $sheetProgressRange))
+            
+            # Update progress with detailed info
+            if ($StatusLabel) {
+                $StatusLabel.Text = "Creating sheet $sheetIndex of $($stigGroups.Count): $stigFileName ($sheetProgress%)..."
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            if ($ProgressBar) {
+                $ProgressBar.Value = $sheetProgress
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            
+            Write-Verbose "Creating sheet $sheetIndex of $($stigGroups.Count): $stigFileName"
+            $sheet = New-StigSheet -Workbook $workbook -SheetName $stigFileName -Vulnerabilities $stigGroup.Group -Headers $headers
+            $sheets += $sheet
+        }
+        
+        # Step 4: Create Dashboard as the first sheet
+        if ($StatusLabel) {
+            $StatusLabel.Text = "Step 4/$totalSteps" + ": Creating Dashboard (85%)..."
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        if ($ProgressBar) {
+            $ProgressBar.Value = 85
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        
+        Write-Verbose "Creating Dashboard sheet..."
+        # Add new sheet at the very beginning using Before parameter
+        $dashboardSheet = $workbook.Worksheets.Add($workbook.Worksheets.Item(1))
+        $dashboardSheet.Name = "Dashboard"
+        
+        # Remove the default Sheet1 if it exists (do this AFTER creating dashboard)
+        if ($sheets.Count -gt 0) {
+            try {
+                # Find Sheet1 - it might have been pushed back in the collection
+                for ($i = 1; $i -le $workbook.Worksheets.Count; $i++) {
+                    if ($workbook.Worksheets.Item($i).Name -eq "Sheet1") {
+                        $workbook.Worksheets.Item($i).Delete()
+                        break
+                    }
+                }
+            } catch {
+                Write-Verbose "Could not delete default sheet: $_"
+            }
+        }
+        
+        # Dashboard Title - Row 1
+        $dashboardSheet.Cells.Item(1, 1) = "STIG NIST Mapping - Compliance Dashboard"
+        $dashboardSheet.Cells.Item(1, 1).Font.Size = 18
+        $dashboardSheet.Cells.Item(1, 1).Font.Bold = $true
+        $dashboardSheet.Cells.Item(1, 1).Font.Color = 0xFFFFFF
+        $titleRange = $dashboardSheet.Range("A1:L1")
+        $titleRange.Merge() | Out-Null
+        $titleRange.Interior.Color = 0x0070C0
+        $titleRange.HorizontalAlignment = -4108  # xlCenter
+        $titleRange.VerticalAlignment = -4108
+        $dashboardSheet.Rows.Item(1).RowHeight = 35
+        
+        # Headers - Row 3
+        $row = 3
+        $headers = @("System Name", "Total Findings", "Open", "Not a Finding", "Not Reviewed", "High", "Medium", "Low", "Compliance %", "Open High", "Open Medium", "Open Low")
+        for ($col = 1; $col -le $headers.Count; $col++) {
+            $dashboardSheet.Cells.Item($row, $col) = $headers[$col - 1]
+            $dashboardSheet.Cells.Item($row, $col).Font.Bold = $true
+            $dashboardSheet.Cells.Item($row, $col).Interior.Color = 0xD9E1F2
+            $dashboardSheet.Cells.Item($row, $col).HorizontalAlignment = -4108  # xlCenter
+        }
+        
+        # Data rows with INDIRECT formulas - Rows 4-13 (10 rows for STIG sheets)
+        $dataStartRow = 4
+        $dataEndRow = $dataStartRow + 9  # 10 rows for systems
+        
+        # Populate sheet names in column A and formulas
+        $sheetIndex = 0
+        foreach ($stigGroup in $stigGroups) {
+            if ($sheetIndex -ge 10) { break }  # Limit to 10 rows
+            
+            $currentRow = $dataStartRow + $sheetIndex
+            $sheetName = $stigGroup.Name -replace '\.(ckl|cklb)$', '' -replace '[:\\\/\[\]\*\?<\>\|\-]', '_'
+            if ($sheetName.Length -gt 31) { $sheetName = $sheetName.Substring(0, 31) }
+            
+            # Column A: System Name
+            $dashboardSheet.Cells.Item($currentRow, 1) = $sheetName
+            
+            # Column B: Total Findings = COUNTA-1 (subtract header)
+            $dashboardSheet.Cells.Item($currentRow, 2).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTA(INDIRECT(A$currentRow&`"!I:I`"))-1,0)"
+            
+            # Column C: Open
+            $dashboardSheet.Cells.Item($currentRow, 3).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTIF(INDIRECT(A$currentRow&`"!I:I`"),`"open`"),0)"
+            
+            # Column D: Not a Finding (handles both formats)
+            $dashboardSheet.Cells.Item($currentRow, 4).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),SUMPRODUCT(COUNTIF(INDIRECT(A$currentRow&`"!I:I`"),{`"not_a_finding`",`"notafinding`"})),0)"
+            
+            # Column E: Not Reviewed
+            $dashboardSheet.Cells.Item($currentRow, 5).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTIF(INDIRECT(A$currentRow&`"!I:I`"),`"not_reviewed`"),0)"
+            
+            # Column F: High
+            $dashboardSheet.Cells.Item($currentRow, 6).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!H:H`")),COUNTIF(INDIRECT(A$currentRow&`"!H:H`"),`"high`"),0)"
+            
+            # Column G: Medium
+            $dashboardSheet.Cells.Item($currentRow, 7).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!H:H`")),COUNTIF(INDIRECT(A$currentRow&`"!H:H`"),`"medium`"),0)"
+            
+            # Column H: Low
+            $dashboardSheet.Cells.Item($currentRow, 8).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!H:H`")),COUNTIF(INDIRECT(A$currentRow&`"!H:H`"),`"low`"),0)"
+            
+            # Column I: Compliance % = (Not a Finding / Total) * 100
+            $dashboardSheet.Cells.Item($currentRow, 9).Formula = "=IF(B$currentRow>0,ROUND((D$currentRow/B$currentRow)*100,1),0)"
+            $dashboardSheet.Cells.Item($currentRow, 9).NumberFormat = "0.0%"
+            
+            # Column J: Open High
+            $dashboardSheet.Cells.Item($currentRow, 10).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTIFS(INDIRECT(A$currentRow&`"!I:I`"),`"open`",INDIRECT(A$currentRow&`"!H:H`"),`"high`"),0)"
+            
+            # Column K: Open Medium
+            $dashboardSheet.Cells.Item($currentRow, 11).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTIFS(INDIRECT(A$currentRow&`"!I:I`"),`"open`",INDIRECT(A$currentRow&`"!H:H`"),`"medium`"),0)"
+            
+            # Column L: Open Low
+            $dashboardSheet.Cells.Item($currentRow, 12).Formula = "=IF(ISREF(INDIRECT(A$currentRow&`"!I:I`")),COUNTIFS(INDIRECT(A$currentRow&`"!I:I`"),`"open`",INDIRECT(A$currentRow&`"!H:H`"),`"low`"),0)"
+            
+            $sheetIndex++
+        }
+        
+        # TOTALS Row - Row 14
+        $row = 14
+        $dashboardSheet.Cells.Item($row, 1) = "TOTALS"
+        $dashboardSheet.Cells.Item($row, 1).Font.Bold = $true
+        $dashboardSheet.Cells.Item($row, 1).Interior.Color = 0xFFD966
+        
+        # Total formulas (SUM B4:B13, etc.)
+        $dashboardSheet.Cells.Item($row, 2).Formula = "=SUM(B4:B13)"
+        $dashboardSheet.Cells.Item($row, 3).Formula = "=SUM(C4:C13)"
+        $dashboardSheet.Cells.Item($row, 4).Formula = "=SUM(D4:D13)"
+        $dashboardSheet.Cells.Item($row, 5).Formula = "=SUM(E4:E13)"
+        $dashboardSheet.Cells.Item($row, 6).Formula = "=SUM(F4:F13)"
+        $dashboardSheet.Cells.Item($row, 7).Formula = "=SUM(G4:G13)"
+        $dashboardSheet.Cells.Item($row, 8).Formula = "=SUM(H4:H13)"
+        $dashboardSheet.Cells.Item($row, 9).Formula = "=IF(B14>0,ROUND((D14/B14)*100,1),0)"
+        $dashboardSheet.Cells.Item($row, 9).NumberFormat = "0.0%"
+        $dashboardSheet.Cells.Item($row, 10).Formula = "=SUM(J4:J13)"
+        $dashboardSheet.Cells.Item($row, 11).Formula = "=SUM(K4:K13)"
+        $dashboardSheet.Cells.Item($row, 12).Formula = "=SUM(L4:L13)"
+        
+        # Format TOTALS row
+        $totalsRange = $dashboardSheet.Range("A14:L14")
+        $totalsRange.Font.Bold = $true
+        $totalsRange.Interior.Color = 0xFFD966
+        
+        # Severity & Status Breakdown - Row 16
+        $row = 16
+        $dashboardSheet.Cells.Item($row, 1) = "Severity & Status Breakdown"
+        $dashboardSheet.Cells.Item($row, 1).Font.Bold = $true
+        $dashboardSheet.Cells.Item($row, 1).Font.Size = 12
+        $dashboardSheet.Cells.Item($row, 2) = "Number"
+        $dashboardSheet.Cells.Item($row, 2).Font.Bold = $true
+        
+        # Breakdown items
+        $row++
+        $dashboardSheet.Cells.Item($row, 1) = "CAT I Open (High)"
+        $dashboardSheet.Cells.Item($row, 2).Formula = "=J14"
+        $dashboardSheet.Cells.Item($row, 1).Interior.Color = 0xFFCCCC
+        
+        $row++
+        $dashboardSheet.Cells.Item($row, 1) = "CAT II Open (Medium)"
+        $dashboardSheet.Cells.Item($row, 2).Formula = "=K14"
+        $dashboardSheet.Cells.Item($row, 1).Interior.Color = 0xFFE699
+        
+        $row++
+        $dashboardSheet.Cells.Item($row, 1) = "CAT III Open (Low)"
+        $dashboardSheet.Cells.Item($row, 2).Formula = "=L14"
+        $dashboardSheet.Cells.Item($row, 1).Interior.Color = 0xFFFF99
+        
+        $row++
+        $dashboardSheet.Cells.Item($row, 1) = "Not a Finding"
+        $dashboardSheet.Cells.Item($row, 2).Formula = "=D14"
+        $dashboardSheet.Cells.Item($row, 1).Interior.Color = 0xC6EFCE
+        
+        # Format dashboard columns
+        $dashboardSheet.Columns.Item(1).ColumnWidth = 35  # System Name
+        $dashboardSheet.Columns.Item(2).ColumnWidth = 14  # Total Findings
+        $dashboardSheet.Columns.Item(3).ColumnWidth = 10  # Open
+        $dashboardSheet.Columns.Item(4).ColumnWidth = 14  # Not a Finding
+        $dashboardSheet.Columns.Item(5).ColumnWidth = 13  # Not Reviewed
+        $dashboardSheet.Columns.Item(6).ColumnWidth = 10  # High
+        $dashboardSheet.Columns.Item(7).ColumnWidth = 10  # Medium
+        $dashboardSheet.Columns.Item(8).ColumnWidth = 10  # Low
+        $dashboardSheet.Columns.Item(9).ColumnWidth = 13  # Compliance %
+        $dashboardSheet.Columns.Item(10).ColumnWidth = 11  # Open High
+        $dashboardSheet.Columns.Item(11).ColumnWidth = 13  # Open Medium
+        $dashboardSheet.Columns.Item(12).ColumnWidth = 11  # Open Low
+        
+        # Create Dashboard table with blue styling
+        try {
+            $tableRange = $dashboardSheet.Range("A3:L14")
+            $dashboardTable = $dashboardSheet.ListObjects.Add(1, $tableRange, $null, 1)
+            $dashboardTable.Name = "DashboardTable"
+            $dashboardTable.TableStyle = "TableStyleMedium9"  # Blue table style
+        } catch {
+            Write-Verbose "Warning: Could not create dashboard table: $_"
+        }
+        
+        # Create Charts - positioned to match template layout
+        try {
+            Write-Verbose "Creating dashboard charts..."
+            
+            # Chart 1: Status Breakdown by System (Top Right - Stacked Bar)
+            $chart1 = $dashboardSheet.ChartObjects().Add(800, 30, 450, 280)
+            $chart1.Chart.ChartType = 52  # xlColumnStacked
+            $chart1.Chart.SetSourceData($dashboardSheet.Range("A3:A14,C3:E14"))
+            $chart1.Chart.HasTitle = $true
+            $chart1.Chart.ChartTitle.Text = "Status Breakdown by System"
+            $chart1.Chart.ChartTitle.Font.Size = 14
+            $chart1.Chart.ChartTitle.Font.Bold = $true
+            $chart1.Chart.HasLegend = $true
+            $chart1.Chart.Legend.Position = -4152  # xlLegendPositionBottom
+            
+            # Format chart colors for status
+            try {
+                $chart1.Chart.SeriesCollection(1).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(255, 192, 0))  # Orange - Open
+                $chart1.Chart.SeriesCollection(2).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(146, 208, 80))  # Green - Not a Finding
+                $chart1.Chart.SeriesCollection(3).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(155, 94, 230))  # Purple - Not Reviewed
+            } catch {
+                Write-Verbose "Could not set chart1 colors: $_"
+            }
+            
+            # Chart 2: CAT/Severity Status Overview (Center - Pie Chart)
+            $chart2 = $dashboardSheet.ChartObjects().Add(220, 330, 450, 280)
+            $chart2.Chart.ChartType = 5  # xlPie
+            $chart2.Chart.SetSourceData($dashboardSheet.Range("A17:B20"))
+            $chart2.Chart.HasTitle = $true
+            $chart2.Chart.ChartTitle.Text = "CAT/Severity Status Overview"
+            $chart2.Chart.ChartTitle.Font.Size = 14
+            $chart2.Chart.ChartTitle.Font.Bold = $true
+            $chart2.Chart.HasLegend = $true
+            $chart2.Chart.Legend.Position = -4161  # xlLegendPositionRight
+            
+            # Add data labels to pie chart
+            try {
+                $chart2.Chart.SeriesCollection(1).HasDataLabels = $true
+                $chart2.Chart.SeriesCollection(1).DataLabels.ShowPercentage = $true
+                $chart2.Chart.SeriesCollection(1).DataLabels.ShowValue = $true
+                $chart2.Chart.SeriesCollection(1).DataLabels.Position = 2  # xlLabelPositionBestFit
+            } catch {
+                Write-Verbose "Could not set chart2 data labels: $_"
+            }
+            
+            # Chart 3: Open Items by Severity (Bottom Right - Clustered Column)
+            $chart3 = $dashboardSheet.ChartObjects().Add(800, 330, 450, 280)
+            $chart3.Chart.ChartType = 51  # xlColumnClustered
+            $chart3.Chart.SetSourceData($dashboardSheet.Range("A3:A14,J3:L14"))
+            $chart3.Chart.HasTitle = $true
+            $chart3.Chart.ChartTitle.Text = "Open Items by Severity (Priority View)"
+            $chart3.Chart.ChartTitle.Font.Size = 14
+            $chart3.Chart.ChartTitle.Font.Bold = $true
+            $chart3.Chart.HasLegend = $true
+            $chart3.Chart.Legend.Position = -4152  # xlLegendPositionBottom
+            
+            # Format chart colors for severity
+            try {
+                $chart3.Chart.SeriesCollection(1).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(192, 0, 0))  # Red - High
+                $chart3.Chart.SeriesCollection(2).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(255, 192, 0))  # Orange - Medium
+                $chart3.Chart.SeriesCollection(3).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(255, 255, 0))  # Yellow - Low
+            } catch {
+                Write-Verbose "Could not set chart3 colors: $_"
+            }
+            
+            # Chart 4: Compliance % by System (Bottom Left - Bar Chart)
+            $chart4 = $dashboardSheet.ChartObjects().Add(20, 630, 450, 280)
+            $chart4.Chart.ChartType = 57  # xlBarClustered (horizontal bars)
+            $chart4.Chart.SetSourceData($dashboardSheet.Range("A3:A14,I3:I14"))
+            $chart4.Chart.HasTitle = $true
+            $chart4.Chart.ChartTitle.Text = "Compliance % by System"
+            $chart4.Chart.ChartTitle.Font.Size = 14
+            $chart4.Chart.ChartTitle.Font.Bold = $true
+            $chart4.Chart.HasLegend = $false
+            
+            # Format compliance chart
+            try {
+                $chart4.Chart.SeriesCollection(1).Format.Fill.ForeColor.RGB = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb(0, 112, 192))  # Blue
+                $chart4.Chart.Axes(1).MaximumScale = 100  # Set X-axis to 100% max
+            } catch {
+                Write-Verbose "Could not set chart4 formatting: $_"
+            }
+            
+        } catch {
+            Write-Verbose "Warning: Could not create one or more charts: $_"
+        }
+        
+        # Create NIST Control sheets (Compliance, CAT I, CAT II, CAT III)
+        try {
+            Write-Verbose "Creating NIST Control sheets..."
+            New-NistControlSheets -Workbook $workbook -InsertAfterSheet $dashboardSheet
+        } catch {
+            Write-Verbose "Warning: Could not create NIST Control sheets: $_"
+        }
+        
+        # Step 5: Save workbook
+        if ($StatusLabel) {
+            $StatusLabel.Text = "Step 5/$totalSteps" + ": Saving workbook (90%)..."
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        if ($ProgressBar) {
+            $ProgressBar.Value = 90
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        
+        if (-not $workbook) {
+            throw "Workbook object is null"
+        }
+        
+        if (Test-Path $OutputPath) {
+            Remove-Item -Path $OutputPath -Force
+        }
+        
+        # Re-enable calculation and screen updating before save
+        try {
+            $excel.Calculation = -4105  # xlCalculationAutomatic
+        } catch {
+            Write-Verbose "Could not set automatic calculation: $_"
+        }
+        $excel.ScreenUpdating = $true
+        
+        # Convert to full path for Excel
+        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+        
+        $workbook.SaveAs($fullPath, 51)  # xlOpenXMLWorkbook
+        
+        if ($ProgressBar) {
+            $ProgressBar.Value = 100
+        }
+        if ($StatusLabel) {
+            $StatusLabel.Text = "Export complete (100%)!"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        
+        $workbook.Close($false)
+        
+        return @{
+            Success = $true
+            Path = $OutputPath
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+        }
+    }
+    finally {
+        # Clean up COM objects in proper order
+        if ($dashboardSheet) { 
+            try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($dashboardSheet) } catch {}
+            $dashboardSheet = $null
+        }
+        if ($sheets -and $sheets.Count -gt 0) {
+            foreach ($sheet in $sheets) {
+                try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sheet) } catch {}
+            }
+            $sheets = @()
+        }
+        if ($workbook) { 
+            try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) } catch {}
+            $workbook = $null
+        }
+        if ($excel) {
+            try { 
+                $excel.Quit() 
+                Start-Sleep -Milliseconds 100
+            } catch {}
+            try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) } catch {}
+            $excel = $null
+        }
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
+    }
+}
+
+#endregion
+
+#region GUI
+
+function Show-MainForm {
+    # Create main form with modern styling
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "STIG Analysis Tool v2.0"
+    $form.Size = New-Object System.Drawing.Size(1000, 750)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = "FixedSingle"
+    $form.MaximizeBox = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 245)
+    $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    
+    # Status bar at bottom with modern styling
+    $statusBar = New-Object System.Windows.Forms.StatusStrip
+    $statusBar.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 48)
+    $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $statusLabel.Text = "Ready"
+    $statusLabel.ForeColor = [System.Drawing.Color]::White
+    $statusBar.Items.Add($statusLabel) | Out-Null
+    $form.Controls.Add($statusBar)
+    
+    # Header panel with gradient-like effect
+    $headerPanel = New-Object System.Windows.Forms.Panel
+    $headerPanel.Location = New-Object System.Drawing.Point(0, 0)
+    $headerPanel.Size = New-Object System.Drawing.Size(1000, 80)
+    $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $form.Controls.Add($headerPanel)
+    
+    # Title label
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Location = New-Object System.Drawing.Point(30, 20)
+    $titleLabel.Size = New-Object System.Drawing.Size(700, 40)
+    $titleLabel.Text = "STIG to NIST Control Mapper"
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 20, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.ForeColor = [System.Drawing.Color]::White
+    $titleLabel.BackColor = [System.Drawing.Color]::Transparent
+    $headerPanel.Controls.Add($titleLabel)
+    
+    # Subtitle
+    $subtitleLabel = New-Object System.Windows.Forms.Label
+    $subtitleLabel.Location = New-Object System.Drawing.Point(32, 55)
+    $subtitleLabel.Size = New-Object System.Drawing.Size(700, 20)
+    $subtitleLabel.Text = "Air-gapped STIG analysis and NIST 800-53 mapping"
+    $subtitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $subtitleLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+    $subtitleLabel.BackColor = [System.Drawing.Color]::Transparent
+    $headerPanel.Controls.Add($subtitleLabel)
+    
+    # Group box for CCI Mappings with modern styling
+    $cciGroupBox = New-Object System.Windows.Forms.GroupBox
+    $cciGroupBox.Location = New-Object System.Drawing.Point(30, 100)
+    $cciGroupBox.Size = New-Object System.Drawing.Size(930, 110)
+    $cciGroupBox.Text = " 1. CCI Mappings (U_CCI_List.xml) "
+    $cciGroupBox.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $cciGroupBox.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $cciGroupBox.BackColor = [System.Drawing.Color]::White
+    $cciGroupBox.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $form.Controls.Add($cciGroupBox)
+    
+    $cciTextBox = New-Object System.Windows.Forms.TextBox
+    $cciTextBox.Location = New-Object System.Drawing.Point(20, 35)
+    $cciTextBox.Size = New-Object System.Drawing.Size(720, 23)
+    $cciTextBox.ReadOnly = $true
+    $cciTextBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $cciTextBox.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $cciGroupBox.Controls.Add($cciTextBox)
+    
+    $cciBrowseBtn = New-Object System.Windows.Forms.Button
+    $cciBrowseBtn.Location = New-Object System.Drawing.Point(750, 33)
+    $cciBrowseBtn.Size = New-Object System.Drawing.Size(160, 30)
+    $cciBrowseBtn.Text = "Browse..."
+    $cciBrowseBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $cciBrowseBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $cciBrowseBtn.ForeColor = [System.Drawing.Color]::White
+    $cciBrowseBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $cciBrowseBtn.FlatAppearance.BorderSize = 0
+    $cciBrowseBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $cciGroupBox.Controls.Add($cciBrowseBtn)
+    
+    $cciStatusLabel = New-Object System.Windows.Forms.Label
+    $cciStatusLabel.Location = New-Object System.Drawing.Point(20, 70)
+    $cciStatusLabel.Size = New-Object System.Drawing.Size(880, 25)
+    $cciStatusLabel.Text = "No CCI mappings loaded"
+    $cciStatusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $cciStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+    $cciGroupBox.Controls.Add($cciStatusLabel)
+    
+    # Group box for STIG Files with modern styling
+    $stigGroupBox = New-Object System.Windows.Forms.GroupBox
+    $stigGroupBox.Location = New-Object System.Drawing.Point(30, 230)
+    $stigGroupBox.Size = New-Object System.Drawing.Size(930, 350)
+    $stigGroupBox.Text = " 2. STIG Files (CKL/CKLB) "
+    $stigGroupBox.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $stigGroupBox.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $stigGroupBox.BackColor = [System.Drawing.Color]::White
+    $stigGroupBox.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $form.Controls.Add($stigGroupBox)
+    
+    $stigListBox = New-Object System.Windows.Forms.ListBox
+    $stigListBox.Location = New-Object System.Drawing.Point(20, 35)
+    $stigListBox.Size = New-Object System.Drawing.Size(720, 240)
+    $stigListBox.SelectionMode = "MultiExtended"
+    $stigListBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+    $stigListBox.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $stigListBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $stigGroupBox.Controls.Add($stigListBox)
+    
+    $stigAddBtn = New-Object System.Windows.Forms.Button
+    $stigAddBtn.Location = New-Object System.Drawing.Point(750, 35)
+    $stigAddBtn.Size = New-Object System.Drawing.Size(160, 35)
+    $stigAddBtn.Text = "Add Files..."
+    $stigAddBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $stigAddBtn.BackColor = [System.Drawing.Color]::FromArgb(16, 124, 16)
+    $stigAddBtn.ForeColor = [System.Drawing.Color]::White
+    $stigAddBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $stigAddBtn.FlatAppearance.BorderSize = 0
+    $stigAddBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $stigGroupBox.Controls.Add($stigAddBtn)
+    
+    $stigClearBtn = New-Object System.Windows.Forms.Button
+    $stigClearBtn.Location = New-Object System.Drawing.Point(750, 80)
+    $stigClearBtn.Size = New-Object System.Drawing.Size(160, 35)
+    $stigClearBtn.Text = "Clear All"
+    $stigClearBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $stigClearBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+    $stigClearBtn.ForeColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $stigClearBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $stigClearBtn.FlatAppearance.BorderSize = 0
+    $stigClearBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $stigGroupBox.Controls.Add($stigClearBtn)
+    
+    $stigStatsLabel = New-Object System.Windows.Forms.Label
+    $stigStatsLabel.Location = New-Object System.Drawing.Point(20, 290)
+    $stigStatsLabel.Size = New-Object System.Drawing.Size(880, 45)
+    $stigStatsLabel.Text = "No STIG files loaded"
+    $stigStatsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $stigStatsLabel.ForeColor = [System.Drawing.Color]::Gray
+    $stigGroupBox.Controls.Add($stigStatsLabel)
+    
+    # Group box for Export with modern styling
+    $exportGroupBox = New-Object System.Windows.Forms.GroupBox
+    $exportGroupBox.Location = New-Object System.Drawing.Point(30, 600)
+    $exportGroupBox.Size = New-Object System.Drawing.Size(930, 120)
+    $exportGroupBox.Text = " 3. Export to Excel "
+    $exportGroupBox.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $exportGroupBox.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $exportGroupBox.BackColor = [System.Drawing.Color]::White
+    $exportGroupBox.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $form.Controls.Add($exportGroupBox)
+    
+    $exportBtn = New-Object System.Windows.Forms.Button
+    $exportBtn.Location = New-Object System.Drawing.Point(20, 35)
+    $exportBtn.Size = New-Object System.Drawing.Size(220, 45)
+    $exportBtn.Text = "Export to Excel..."
+    $exportBtn.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $exportBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $exportBtn.ForeColor = [System.Drawing.Color]::White
+    $exportBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $exportBtn.FlatAppearance.BorderSize = 0
+    $exportBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $exportBtn.Enabled = $false
+    $exportGroupBox.Controls.Add($exportBtn)
+    
+    $exportStatusLabel = New-Object System.Windows.Forms.Label
+    $exportStatusLabel.Location = New-Object System.Drawing.Point(260, 30)
+    $exportStatusLabel.Size = New-Object System.Drawing.Size(650, 25)
+    $exportStatusLabel.Text = "Load CCI mappings and STIG files to enable export"
+    $exportStatusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $exportStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+    $exportGroupBox.Controls.Add($exportStatusLabel)
+    
+    # Progress Bar for export
+    $exportProgressBar = New-Object System.Windows.Forms.ProgressBar
+    $exportProgressBar.Location = New-Object System.Drawing.Point(260, 60)
+    $exportProgressBar.Size = New-Object System.Drawing.Size(650, 25)
+    $exportProgressBar.Style = 'Continuous'
+    $exportProgressBar.Minimum = 0
+    $exportProgressBar.Maximum = 100
+    $exportProgressBar.Value = 0
+    $exportProgressBar.Visible = $false  # Hidden until export starts
+    $exportGroupBox.Controls.Add($exportProgressBar)
+    
+    #region Event Handlers
+    
+    # CCI Browse button
+    $cciBrowseBtn.Add_Click({
+        $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+        $openFileDialog.Filter = "CCI List XML (*.xml)|*.xml|All Files (*.*)|*.*"
+        $openFileDialog.Title = "Select U_CCI_List.xml"
+        
+        if ($openFileDialog.ShowDialog() -eq "OK") {
+            $cciTextBox.Text = $openFileDialog.FileName
+            $statusLabel.Text = "Loading CCI mappings..."
+            $form.Refresh()
+            
+            $result = Import-CciMappings -XmlPath $openFileDialog.FileName
+            
+            if ($result.Success) {
+                $script:CciMappings = $result.Mappings
+                $cciStatusLabel.Text = "[OK] Loaded $($result.Count) CCI mappings"
+                $cciStatusLabel.ForeColor = [System.Drawing.Color]::Green
+                $statusLabel.Text = "CCI mappings loaded successfully"
+                
+                # Update export button state
+                if ($script:VulnerabilityData.Count -gt 0) {
+                    $exportBtn.Enabled = $true
+                }
+            }
+            else {
+                [System.Windows.Forms.MessageBox]::Show("Failed to load CCI mappings:`n$($result.Error)", "Error", "OK", "Error")
+                $cciStatusLabel.Text = "[ERROR] Failed to load CCI mappings"
+                $cciStatusLabel.ForeColor = [System.Drawing.Color]::Red
+                $statusLabel.Text = "Error loading CCI mappings"
+            }
+        }
+    })
+    
+    # STIG Add button
+    $stigAddBtn.Add_Click({
+        if ($script:CciMappings.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Please load CCI mappings first.", "Information", "OK", "Information")
+            return
+        }
+        
+        $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+        $openFileDialog.Filter = "STIG Files (*.ckl;*.cklb)|*.ckl;*.cklb|CKL Files (*.ckl)|*.ckl|CKLB Files (*.cklb)|*.cklb|All Files (*.*)|*.*"
+        $openFileDialog.Title = "Select STIG Files"
+        $openFileDialog.Multiselect = $true
+        
+        if ($openFileDialog.ShowDialog() -eq "OK") {
+            $statusLabel.Text = "Loading STIG files..."
+            $form.Refresh()
+            
+            $totalLoaded = 0
+            foreach ($file in $openFileDialog.FileNames) {
+                $fileName = Split-Path -Path $file -Leaf
+                
+                # Check if already loaded
+                if ($script:LoadedFiles -contains $fileName) {
+                    continue
+                }
+                
+                $extension = [System.IO.Path]::GetExtension($file).ToLower()
+                $result = $null
+                
+                if ($extension -eq '.ckl' -or $extension -eq '.xml') {
+                    $result = Import-CklFile -Path $file -CciMappings $script:CciMappings
+                }
+                elseif ($extension -eq '.cklb' -or $extension -eq '.json') {
+                    $result = Import-CklbFile -Path $file -CciMappings $script:CciMappings
+                }
+                
+                if ($result -and $result.Success) {
+                    $script:VulnerabilityData += $result.Vulnerabilities
+                    $script:LoadedFiles += $fileName
+                    $stigListBox.Items.Add("$fileName ($($result.Count) findings)")
+                    $totalLoaded += $result.Count
+                }
+            }
+            
+            if ($totalLoaded -gt 0) {
+                $stigStatsLabel.Text = "[OK] Loaded $($script:LoadedFiles.Count) files with $($script:VulnerabilityData.Count) total findings"
+                $stigStatsLabel.ForeColor = [System.Drawing.Color]::Green
+                $statusLabel.Text = "STIG files loaded successfully"
+                $exportBtn.Enabled = $true
+            }
+        }
+    })
+    
+    # STIG Clear button
+    $stigClearBtn.Add_Click({
+        $script:VulnerabilityData = @()
+        $script:LoadedFiles = @()
+        $stigListBox.Items.Clear()
+        $stigStatsLabel.Text = "No STIG files loaded"
+        $stigStatsLabel.ForeColor = [System.Drawing.Color]::Gray
+        $exportBtn.Enabled = $false
+        $statusLabel.Text = "STIG files cleared"
+    })
+    
+    # Export button
+    $exportBtn.Add_Click({
+        if ($script:VulnerabilityData.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No data to export.", "Information", "OK", "Information")
+            return
+        }
+        
+        $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveFileDialog.Filter = "Excel Files (*.xlsx)|*.xlsx"
+        $saveFileDialog.Title = "Save Excel Report"
+        $saveFileDialog.FileName = "STIG-Analysis-$(Get-Date -Format 'yyyyMMdd-HHmmss').xlsx"
+        
+        if ($saveFileDialog.ShowDialog() -eq "OK") {
+            # Show progress bar and disable button during export
+            $exportProgressBar.Visible = $true
+            $exportProgressBar.Value = 0
+            $exportBtn.Enabled = $false
+            $statusLabel.Text = "Exporting to Excel..."
+            $exportStatusLabel.Text = "Starting export..."
+            $form.Refresh()
+            
+            # Call export with progress tracking
+            $result = Export-ToExcel -Vulnerabilities $script:VulnerabilityData -OutputPath $saveFileDialog.FileName -StatusLabel $exportStatusLabel -ProgressBar $exportProgressBar
+            
+            # Re-enable button after export
+            $exportBtn.Enabled = $true
+            
+            if ($result.Success) {
+                $exportStatusLabel.Text = "[OK] Exported $($script:VulnerabilityData.Count) findings to Excel"
+                $exportStatusLabel.ForeColor = [System.Drawing.Color]::Green
+                $statusLabel.Text = "Export completed successfully"
+                
+                # Hide progress bar after short delay
+                Start-Sleep -Milliseconds 500
+                $exportProgressBar.Visible = $false
+                
+                $openResult = [System.Windows.Forms.MessageBox]::Show("Export completed successfully!`n`nOpen the file now?", "Success", "YesNo", "Information")
+                if ($openResult -eq "Yes") {
+                    Start-Process $saveFileDialog.FileName
+                }
+            }
+            else {
+                $exportProgressBar.Visible = $false
+                [System.Windows.Forms.MessageBox]::Show("Failed to export:`n$($result.Error)", "Error", "OK", "Error")
+                $exportStatusLabel.Text = "[ERROR] Export failed"
+                $exportStatusLabel.ForeColor = [System.Drawing.Color]::Red
+                $statusLabel.Text = "Export failed"
+            }
+        }
+    })
+    
+    #endregion
+    
+    # Show form
+    $form.Add_Shown({ $form.Activate() })
+    [void]$form.ShowDialog()
+}
+
+#endregion
+
+# Check for Excel
+try {
+    $null = New-Object -ComObject Excel.Application -ErrorAction Stop
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show("Microsoft Excel is not installed.`n`nThis tool requires Office 2016 or later.", "Error", "OK", "Error")
+    exit 1
+}
+
+# Start the application
+Show-MainForm
