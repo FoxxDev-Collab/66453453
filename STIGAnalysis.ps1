@@ -966,16 +966,27 @@ function Refresh-NistCompliance {
     param(
         $SummaryGrid,
         $DetailGrid,
-        $SiteCombo
+        $SiteCombo,
+        $FamilyCombo
     )
 
     try {
-        # Build site filter
-        $siteFilter = ""
+        # Build filters
+        $whereClause = ""
+
         if ($SiteCombo -and $SiteCombo.SelectedValue -and $SiteCombo.SelectedValue -gt 0) {
             $siteId = [int]$SiteCombo.SelectedValue
-            $siteFilter = "WHERE st.Site_ID = $siteId"
+            if ($whereClause) { $whereClause += " AND " } else { $whereClause = "WHERE " }
+            $whereClause += "st.Site_ID = $siteId"
         }
+
+        if ($FamilyCombo -and $FamilyCombo.SelectedItem -and $FamilyCombo.SelectedItem -ne "All Families") {
+            $family = $FamilyCombo.SelectedItem.ToString()
+            if ($whereClause) { $whereClause += " AND " } else { $whereClause = "WHERE " }
+            $whereClause += "v.Control_Families LIKE '%$family%'"
+        }
+
+        $siteFilter = $whereClause
 
         # Control Family Summary - simplified for Access SQL
         if ($siteFilter) {
@@ -2336,7 +2347,21 @@ function Show-MainApplication {
     $nistSiteComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
     $nistToolbar.Controls.Add($nistSiteComboBox)
 
-    $nistRefreshBtn = New-StyledButton -Text "⟳ Refresh" -Location (New-Object System.Drawing.Point(310, 10)) -Size (New-Object System.Drawing.Size(100, 28))
+    $nistFamilyLabel = New-Object System.Windows.Forms.Label
+    $nistFamilyLabel.Text = "Control Family:"
+    $nistFamilyLabel.Location = New-Object System.Drawing.Point(310, 15)
+    $nistFamilyLabel.Size = New-Object System.Drawing.Size(90, 20)
+    $nistToolbar.Controls.Add($nistFamilyLabel)
+
+    $nistFamilyComboBox = New-Object System.Windows.Forms.ComboBox
+    $nistFamilyComboBox.Location = New-Object System.Drawing.Point(405, 12)
+    $nistFamilyComboBox.Size = New-Object System.Drawing.Size(150, 25)
+    $nistFamilyComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $nistFamilyComboBox.Items.AddRange(@("All Families", "AC", "AT", "AU", "CA", "CM", "CP", "IA", "IR", "MA", "MP", "PE", "PL", "PS", "RA", "SA", "SC", "SI", "PM"))
+    $nistFamilyComboBox.SelectedIndex = 0
+    $nistToolbar.Controls.Add($nistFamilyComboBox)
+
+    $nistRefreshBtn = New-StyledButton -Text "⟳ Refresh" -Location (New-Object System.Drawing.Point(570, 10)) -Size (New-Object System.Drawing.Size(100, 28))
     $nistRefreshBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
     $nistToolbar.Controls.Add($nistRefreshBtn)
 
@@ -2356,6 +2381,33 @@ function Show-MainApplication {
     $nistSummaryGrid.SelectionMode = 'FullRowSelect'
     $nistSummaryGrid.BackgroundColor = [System.Drawing.Color]::White
     $nistSummaryGrid.AutoSizeColumnsMode = 'Fill'
+
+    # Add CellFormatting event for persistent color coding
+    $nistSummaryGrid.Add_CellFormatting({
+        param($sender, $e)
+        if ($e.ColumnIndex -ge 0 -and $e.RowIndex -ge 0) {
+            $columnName = $sender.Columns[$e.ColumnIndex].Name
+            if ($columnName -eq "Percentage Compliant") {
+                $value = $sender.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value
+                if ($value -ne $null -and $value -is [int] -or $value -is [double]) {
+                    $pctVal = [double]$value
+                    if ($pctVal -ge 90) {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(60, 179, 113)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::White
+                    }
+                    elseif ($pctVal -ge 70) {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 215, 0)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::Black
+                    }
+                    else {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 100, 100)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::White
+                    }
+                }
+            }
+        }
+    })
+
     $nistComplianceTab.Controls.Add($nistSummaryGrid)
 
     # Detailed Control Breakdown
@@ -2374,6 +2426,33 @@ function Show-MainApplication {
     $nistDetailGrid.SelectionMode = 'FullRowSelect'
     $nistDetailGrid.BackgroundColor = [System.Drawing.Color]::White
     $nistDetailGrid.AutoSizeColumnsMode = 'Fill'
+
+    # Add CellFormatting event for persistent color coding
+    $nistDetailGrid.Add_CellFormatting({
+        param($sender, $e)
+        if ($e.ColumnIndex -ge 0 -and $e.RowIndex -ge 0) {
+            $columnName = $sender.Columns[$e.ColumnIndex].Name
+            if ($columnName -eq "% Compliant") {
+                $value = $sender.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value
+                if ($value -ne $null -and $value -is [int] -or $value -is [double]) {
+                    $pctVal = [double]$value
+                    if ($pctVal -ge 90) {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(60, 179, 113)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::White
+                    }
+                    elseif ($pctVal -ge 70) {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 215, 0)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::Black
+                    }
+                    else {
+                        $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 100, 100)
+                        $e.CellStyle.ForeColor = [System.Drawing.Color]::White
+                    }
+                }
+            }
+        }
+    })
+
     $nistComplianceTab.Controls.Add($nistDetailGrid)
 
     $tabControl.Controls.Add($nistComplianceTab)
@@ -2421,7 +2500,7 @@ function Show-MainApplication {
                     $nistSiteComboBox.DataSource = $siteItems
                     $nistSiteComboBox.SelectedIndex = 0
                 }
-                Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
+                Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox -FamilyCombo $nistFamilyComboBox
             }
             elseif ($tabControl.SelectedTab -eq $cciManagementTab) {
                 Write-Host "Debug: CCI Management tab selected, refreshing status..." -ForegroundColor DarkGray
@@ -2853,11 +2932,15 @@ ORDER BY v.Severity DESC
 
     # NIST Compliance Event Handlers
     $nistSiteComboBox.Add_SelectedIndexChanged({
-        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
+        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox -FamilyCombo $nistFamilyComboBox
+    })
+
+    $nistFamilyComboBox.Add_SelectedIndexChanged({
+        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox -FamilyCombo $nistFamilyComboBox
     })
 
     $nistRefreshBtn.Add_Click({
-        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox
+        Refresh-NistCompliance -SummaryGrid $nistSummaryGrid -DetailGrid $nistDetailGrid -SiteCombo $nistSiteComboBox -FamilyCombo $nistFamilyComboBox
     })
 
     # CCI Management Event Handlers
